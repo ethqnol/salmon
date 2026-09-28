@@ -1,5 +1,6 @@
 #include "lexer.h"
 #include "parser.h"
+#include "codegen/llvm_codegen.h"
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -8,16 +9,21 @@
 enum class OutputMode {
     Asdl,
     Pretty,
-    Tree
+    Tree,
+    LLVM
 };
 
 static void run_compiler(const std::string &src_name,
                          const std::string &src_code,
                          bool show_tokens = false,
                          OutputMode mode = OutputMode::Asdl) {
-    std::cout << "========================================\n";
-    std::cout << " Compiling: " << src_name << "\n";
-    std::cout << "========================================\n";
+    if (mode == OutputMode::LLVM) {
+        std::cout << "; Compiling: " << src_name << "\n";
+    } else {
+        std::cout << "========================================\n";
+        std::cout << " Compiling: " << src_name << "\n";
+        std::cout << "========================================\n";
+    }
 
     Lexer lexer(src_code);
     std::vector<Token> tokens = lexer.tokenize();
@@ -45,6 +51,11 @@ static void run_compiler(const std::string &src_name,
         program->emit_asdl(std::cout);
         std::cout << "\n";
         break;
+    case OutputMode::LLVM: {
+        LLVMCodegen codegen(std::cout);
+        codegen.generate(*program);
+        break;
+    }
     }
 }
 
@@ -59,15 +70,17 @@ int main(int argc, char *argv[]) {
             if (arg == "-h" || arg == "--help") {
                 std::cout << "Usage: salmon [options] [source_file]\n";
                 std::cout << "Options:\n";
-                std::cout
-                    << "  -p, --pretty   Pretty-print formatted source code from AST\n";
-                std::cout << "  --tree         Print visual AST hierarchy tree\n";
-                std::cout << "  --asdl         Print Zephyr ASDL AST (default)\n";
-                std::cout << "  -t, --tokens   Print lexer tokens before AST\n";
-                std::cout << "  -h, --help     Show this help message\n";
+                std::cout << "  -S, --emit-llvm  Emit textual LLVM IR (or --ir)\n";
+                std::cout << "  -p, --pretty     Pretty-print formatted source code from AST\n";
+                std::cout << "  --tree           Print visual AST hierarchy tree\n";
+                std::cout << "  --asdl           Print Zephyr ASDL AST (default)\n";
+                std::cout << "  -t, --tokens     Print lexer tokens before AST\n";
+                std::cout << "  -h, --help       Show this help message\n";
                 return 0;
             }
-            if (arg == "-p" || arg == "--pretty") {
+            if (arg == "-S" || arg == "--emit-llvm" || arg == "-emit-llvm" || arg == "--ir") {
+                mode = OutputMode::LLVM;
+            } else if (arg == "-p" || arg == "--pretty") {
                 mode = OutputMode::Pretty;
             } else if (arg == "--tree") {
                 mode = OutputMode::Tree;
