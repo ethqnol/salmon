@@ -1,0 +1,42 @@
+include "std/io"
+include "std/mem"
+
+struct Node {
+    int value;
+    Node* next;
+}
+
+def create_node(int val) -> Node* {
+    Node* node = alloc<Node>();
+    if (node == null) {
+        return null;
+    }
+    node->value = val;
+    node->next = null;
+    return node;
+}
+
+def free_list(Node* head) -> void {
+    Node* curr = head;
+    while (curr != null) {
+        Node* temp = curr->next;
+        free(curr);
+        curr = temp;
+    }
+}
+
+def main() -> int {
+    Node* head = create_node(100);
+    head->next = create_node(200);
+    head->next->next = create_node(300);
+
+    // Traversing raw heap nodes
+    Node* curr = head;
+    while (curr != null) {
+        printf("Node value: %d\n", curr->value);
+        curr = curr->next;
+    }
+
+    free_list(head);
+    return 0;
+}

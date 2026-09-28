@@ -1,0 +1,27 @@
+include "std/io"
+
+struct Point {
+    f64 x;
+    f64 y;
+}
+
+def test_features(int a, bool flag) -> int {
+    defer printf("Exiting test_features\n");
+
+    if (flag && a > 0) {
+        a += 10;
+    } else if (a == 0) {
+        a -= 5;
+    } else {
+        a *= 2;
+    }
+
+    Point* pt = alloc<Point>();
+    defer free(pt);
+
+    pt.x = 1.5;
+    pt.y = 2.5;
+
+    int sz = sizeof(Point);
+    return a;
+}

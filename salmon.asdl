@@ -1,0 +1,63 @@
+-- Zephyr Abstract Syntax Description Language (ASDL) for Salmon Lang
+
+module Salmon
+{
+    program = Program(decl* declarations)
+
+    decl = Include(string path)
+         | StructDecl(identifier name, field* fields)
+         | FunctionDecl(identifier name, param* params, type? returnType, stmt body)
+
+    field = Field(type type, identifier name)
+    param = Param(type type, identifier name)
+
+    type = PrimitiveType(primitive_kind kind)
+         | NamedType(identifier name)
+         | ListType(type elementType)
+         | PointerType(type baseType)
+         | SliceType(type elementType)
+         | ArrayType(type elementType, int size)
+
+    primitive_kind = Int | I8 | I16 | I32 | I64
+                   | UInt | U8 | U16 | U32 | U64
+                   | Float | F32 | F64
+                   | Bool | Char | Void
+
+    stmt = Block(stmt* statements)
+         | VarDecl(type type, identifier name, expr? init)
+         | Assignment(expr target, assign_op op, expr value)
+         | ExprStmt(expr expr)
+         | IfStmt(expr condition, stmt thenBranch, stmt? elseBranch)
+         | WhileStmt(expr condition, stmt body)
+         | ForStmt(stmt? init, expr? condition, stmt? update, stmt body)
+         | ReturnStmt(expr? value)
+         | DeferStmt(stmt stmt)
+
+    assign_op = Assign | AddAssign | SubAssign | MulAssign | DivAssign
+
+    expr = BinaryExpr(binary_op op, expr left, expr right)
+         | UnaryExpr(unary_op op, expr operand)
+         | SizeofExpr(expr operand)
+         | PostfixUpdateExpr(postfix_op op, expr operand)
+         | CallExpr(expr callee, expr* args)
+         | IndexExpr(expr object, expr index)
+         | MemberAccessExpr(expr object, identifier member)
+         | IntLiteral(int value)
+         | FloatLiteral(float value)
+         | StringLiteral(string value)
+         | CharLiteral(char value)
+         | BoolLiteral(bool value)
+         | NullLiteral
+         | ArrayLiteral(expr* elements)
+         | ListLiteral(expr* elements)
+         | AllocExpr(type allocType, expr? count)
+         | IdentifierExpr(identifier name)
+
+    binary_op = LogicalOr | LogicalAnd | Equal | NotEqual
+              | Less | LessEqual | Greater | GreaterEqual
+              | Add | Sub | Mul | Div | Mod
+
+    unary_op = AddressOf | Dereference | LogicalNot | Negate
+
+    postfix_op = PostIncrement | PostDecrement
+}

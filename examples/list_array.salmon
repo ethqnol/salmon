@@ -1,0 +1,29 @@
+include "std/io"
+include "std/list"
+
+def print_integers(int[] view) -> void {
+    for (int i = 0; i < view.len; i++) {
+        printf("%d ", view[i]);
+    }
+    printf("\n");
+}
+
+def main() -> int {
+    // Fixed-size stack array
+    int[4] fixed = [10, 20, 30, 40];
+    print_integers(fixed);
+
+    // Dynamic growable list
+    list<int> numbers = list{1, 2, 3};
+    numbers.push(4);
+    numbers.push(5);
+
+    printf("Dynamic list length: %d\n", numbers.len);
+    for (int i = 0; i < numbers.len; i++) {
+        printf("numbers[%d] = %d\n", i, numbers[i]);
+    }
+
+    // Explicit cleanup for dynamic list backing store
+    numbers.free();
+    return 0;
+}
