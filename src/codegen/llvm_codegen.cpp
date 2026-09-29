@@ -262,8 +262,7 @@ void LLVMCodegen::visit(const AssignStmt &node) {
     } else if (const auto *unary =
                    dynamic_cast<const UnaryExpr *>(&node.target())) {
         if (unary->op() == UnaryOp::Dereference) {
-            unary->operand().accept(
-                *this);
+            unary->operand().accept(*this);
             dest_ptr = last_val_;
             dest_type = llvm::Type::getInt32Ty(ctx_);
         }
@@ -333,14 +332,14 @@ void LLVMCodegen::visit(const IfStmt &node) {
     // integer truthy
     if (!cond_val->getType()->isIntegerTy(1)) {
         cond_val = builder_.CreateICmpNE(
-            cond_val,
-            llvm::ConstantInt::get(cond_val->getType(), 0),
-            "ifcond");
+            cond_val, llvm::ConstantInt::get(cond_val->getType(), 0), "ifcond");
     }
 
-    llvm::BasicBlock *then_bb = llvm::BasicBlock::Create(ctx_, "if.then", current_func_);
+    llvm::BasicBlock *then_bb =
+        llvm::BasicBlock::Create(ctx_, "if.then", current_func_);
     llvm::BasicBlock *else_bb = nullptr;
-    llvm::BasicBlock *merge_bb = llvm::BasicBlock::Create(ctx_, "if.end", current_func_);
+    llvm::BasicBlock *merge_bb =
+        llvm::BasicBlock::Create(ctx_, "if.end", current_func_);
 
     if (node.else_branch()) {
         else_bb = llvm::BasicBlock::Create(ctx_, "if.else", current_func_);
@@ -368,9 +367,84 @@ void LLVMCodegen::visit(const IfStmt &node) {
     builder_.SetInsertPoint(merge_bb);
 }
 
-void LLVMCodegen::visit(const WhileStmt &node) { (void)node; }
+void LLVMCodegen::visit(const WhileStmt &node) {
+    llvm::BasicBlock *cond_bb =
+        llvm::BasicBlock::Create(ctx_, "while.cond", current_func_);
+    llvm::BasicBlock *body_bb =
+        llvm::BasicBlock::Create(ctx_, "while.body", current_func_);
+    llvm::BasicBlock *exit_bb =
+        llvm::BasicBlock::Create(ctx_, "while.end", current_func_);
 
-void LLVMCodegen::visit(const ForStmt &node) { (void)node; }
+    builder_.CreateBr(cond_bb);
+
+    builder_.SetInsertPoint(cond_bb);
+
+    node.cond().accept(*this);
+    llvm::Value *cond_val = last_val_;
+
+    if (!cond_val->getType()->isIntegerTy(1)) {
+        cond_val = builder_.CreateICmpNE(
+            cond_val, llvm::ConstantInt::get(cond_val->getType(), 0), "whilecond");
+    }
+    builder_.CreateCondBr(cond_val, body_bb, exit_bb);
+
+    builder_.SetInsertPoint(body_bb);
+    node.body().accept(*this);
+    if (!builder_.GetInsertBlock()->getTerminator()) {
+        builder_.CreateBr(cond_bb);
+    }
+
+    builder_.SetInsertPoint(exit_bb);
+}
+
+void LLVMCodegen::visit(const ForStmt &node) {
+
+    llvm::BasicBlock *cond_bb =
+        llvm::BasicBlock::Create(ctx_, "for.cond", current_func_);
+    llvm::BasicBlock *body_bb =
+        llvm::BasicBlock::Create(ctx_, "for.body", current_func_);
+    llvm::BasicBlock *step_bb =
+        llvm::BasicBlock::Create(ctx_, "for.step", current_func_);
+    llvm::BasicBlock *exit_bb =
+        llvm::BasicBlock::Create(ctx_, "for.end", current_func_);
+
+    push_scope();
+    if (node.init()) {
+        node.init()->accept(*this);
+    }
+
+    builder_.CreateBr(cond_bb);
+
+    builder_.SetInsertPoint(cond_bb);
+    if (node.cond()) {
+        node.cond()->accept(*this);
+        llvm::Value *cond_val = last_val_;
+        if (!cond_val->getType()->isIntegerTy(1)) {
+            cond_val = builder_.CreateICmpNE(
+                cond_val,
+                llvm::ConstantInt::get(cond_val->getType(), 0),
+                "forcond");
+        }
+        builder_.CreateCondBr(cond_val, body_bb, exit_bb);
+    } else {
+        builder_.CreateBr(body_bb);
+    }
+
+    builder_.SetInsertPoint(body_bb);
+    node.body().accept(*this);
+    if (!builder_.GetInsertBlock()->getTerminator()) {
+        builder_.CreateBr(step_bb);
+    }
+
+    builder_.SetInsertPoint(step_bb);
+    if (node.update()) {
+        node.update()->accept(*this);
+    }
+
+    builder_.CreateBr(cond_bb);
+    builder_.SetInsertPoint(exit_bb);
+    pop_scope();
+}
 
 void LLVMCodegen::visit(const ReturnStmt &node) {
     if (node.value()) {
