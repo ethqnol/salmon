@@ -19,6 +19,7 @@ enum class TokenType : uint8_t {
     Dot,
     Semicolon,
     Colon,
+    Ellipsis,
 
     // Operators
     Plus,
@@ -58,6 +59,7 @@ enum class TokenType : uint8_t {
     Include,
     Struct,
     Def,
+    Extern,
     Return,
     Defer,
     If,
@@ -87,6 +89,7 @@ enum class TokenType : uint8_t {
     F64,
     Bool,
     Char,
+    String,
     Void
 };
 

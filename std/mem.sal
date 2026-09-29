@@ -1,0 +1,5 @@
+extern def malloc(i64 size) -> void*;
+extern def free(void* ptr) -> void;
+extern def realloc(void* ptr, i64 size) -> void*;
+extern def memset(void* ptr, int val, i64 size) -> void*;
+extern def memcpy(void* dest, void* src, i64 size) -> void*;

@@ -20,6 +20,7 @@ struct LLVMSymbol {
     std::string name;
     llvm::AllocaInst *alloca_inst{nullptr};
     llvm::Type *type{nullptr};
+    const Type *ast_type{nullptr};
 };
 
 struct StructInfo {
@@ -93,8 +94,12 @@ private:
     void push_scope();
     void pop_scope();
     bool declare_symbol(const std::string &name, llvm::AllocaInst *inst,
-                        llvm::Type *type);
+                        llvm::Type *type, const Type *ast_type = nullptr);
     const LLVMSymbol *lookup_symbol(const std::string &name) const;
+
+    bool is_string_type(const Expr &expr) const;
+    const Type *infer_type(const Expr &expr) const;
+    llvm::Function *get_or_create_strcat();
 
     void emit_runtime_decls();
     void emit_push_definition();
@@ -108,5 +113,6 @@ private:
     llvm::Value *last_val_{nullptr};
     std::vector<std::unordered_map<std::string, LLVMSymbol>> scopes_;
     std::unordered_map<std::string, StructInfo> struct_defs_;
+    std::unordered_map<std::string, const Type *> func_ret_types_;
     std::vector<const Stmt *> defer_stack_;
 };

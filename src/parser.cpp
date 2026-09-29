@@ -1,7 +1,17 @@
 #include "parser.h"
+#include "diagnostic.h"
+#include "lexer.h"
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 
-Parser::Parser(std::vector<Token> tokens, std::string filename)
-    : tokens_(std::move(tokens)), filename_(std::move(filename)) {
+Parser::Parser(std::vector<Token> tokens, std::string filename,
+               SourceManager *source_mgr,
+               std::unordered_set<std::string> *included_files)
+    : tokens_(std::move(tokens)),
+      filename_(std::move(filename)),
+      source_mgr_(source_mgr),
+      included_files_(included_files ? included_files : &default_included_files_) {
 }
 
 const Token &Parser::peek() const {
@@ -52,20 +62,124 @@ const Token &Parser::consume(TokenType type, const std::string &message) {
     error(peek(), message);
 }
 
-void Parser::error(const Token &token, const std::string &message) const {
+void Parser::error(const Token &token, const std::string &message,
+                   const std::vector<std::string> &notes,
+                   const std::vector<std::string> &suggestions) const {
     size_t len = token.lexeme.empty() ? 1 : token.lexeme.size();
     SourceLoc loc{filename_, token.line, token.col, len};
     std::string full_msg = message;
-    if (token.type != TokenType::EndOfFile && !token.lexeme.empty()) {
+    if (token.type != TokenType::EndOfFile && !token.lexeme.empty() &&
+        message.find("cannot find") == std::string::npos &&
+        message.find("unknown standard library module") == std::string::npos) {
         full_msg += " (got '" + token.lexeme + "')";
     }
-    throw ParseError(loc, full_msg);
+    throw ParseError(loc, full_msg, notes, suggestions);
+}
+
+void Parser::parse_include_and_merge(std::vector<std::unique_ptr<Decl>> &decls) {
+    consume(TokenType::Include, "Expected 'include'");
+    const auto &path_tok = consume(TokenType::StringLiteral, "Expected string literal after 'include'");
+    std::string raw_path = path_tok.lexeme;
+
+    static const std::unordered_set<std::string> known_std_modules = {
+        "std/io",
+        "std/mem",
+        "std/math",
+        "std/list"
+    };
+
+    std::vector<std::filesystem::path> candidates;
+    std::vector<std::string> to_try = {raw_path};
+    if (raw_path.size() < 4 || raw_path.substr(raw_path.size() - 4) != ".sal") {
+        to_try.push_back(raw_path + ".sal");
+    }
+
+    for (const auto &p_str : to_try) {
+        std::filesystem::path p(p_str);
+        if (p.is_absolute()) {
+            candidates.push_back(p);
+        } else {
+            if (filename_ != "<stdin>") {
+                candidates.push_back(std::filesystem::path(filename_).parent_path() / p);
+            }
+            candidates.push_back(std::filesystem::current_path() / p);
+            std::error_code ec;
+            auto exe_path = std::filesystem::canonical("/proc/self/exe", ec);
+            if (!ec) {
+                candidates.push_back(exe_path.parent_path() / p);
+                candidates.push_back(exe_path.parent_path().parent_path() / p);
+            }
+        }
+    }
+
+    std::filesystem::path resolved_path;
+    bool found = false;
+    for (const auto &c : candidates) {
+        std::error_code ec;
+        if (std::filesystem::exists(c, ec)) {
+            resolved_path = std::filesystem::canonical(c, ec);
+            if (!ec) {
+                found = true;
+                break;
+            }
+        }
+    }
+
+    if (!found) {
+        if (raw_path.rfind("std/", 0) == 0) {
+            std::vector<std::string> std_candidates(known_std_modules.begin(), known_std_modules.end());
+            std::string sim = DiagnosticEngine::find_similar(raw_path, std_candidates);
+            std::vector<std::string> suggestions;
+            if (!sim.empty()) {
+                suggestions.push_back("did you mean '" + sim + "'?");
+            }
+            error(path_tok, "unknown standard library module '" + raw_path + "'", {}, suggestions);
+        }
+        error(path_tok, "cannot find include file '" + raw_path + "'");
+    }
+
+    std::string can_str = resolved_path.string();
+    if (included_files_->find(can_str) != included_files_->end()) {
+        return;
+    }
+    included_files_->insert(can_str);
+
+    std::ifstream file(can_str);
+    if (!file.is_open()) {
+        error(path_tok, "cannot open include file '" + raw_path + "'");
+    }
+    std::stringstream buf;
+    buf << file.rdbuf();
+    std::string code = buf.str();
+
+    if (source_mgr_) {
+        source_mgr_->add_source(can_str, code);
+    }
+
+    Lexer inc_lexer(code);
+    auto inc_tokens = inc_lexer.tokenize();
+    for (const auto &tok : inc_tokens) {
+        if (tok.type == TokenType::Invalid) {
+            SourceLoc loc{can_str, tok.line, tok.col, tok.lexeme.size()};
+            throw ParseError(loc, "Lexer error: " + tok.lexeme);
+        }
+    }
+
+    Parser inc_parser(std::move(inc_tokens), can_str, source_mgr_, included_files_);
+    auto inc_prog = inc_parser.parse_program();
+    for (auto &d : inc_prog->take_decls()) {
+        decls.push_back(std::move(d));
+    }
 }
 
 std::unique_ptr<Program> Parser::parse_program() {
     std::vector<std::unique_ptr<Decl>> decls;
     while (!is_at_end()) {
-        decls.push_back(parse_decl());
+        if (check(TokenType::Include)) {
+            parse_include_and_merge(decls);
+        } else {
+            decls.push_back(parse_decl());
+        }
     }
     return std::make_unique<Program>(std::move(decls));
 }
@@ -77,10 +191,10 @@ std::unique_ptr<Decl> Parser::parse_decl() {
     if (check(TokenType::Struct)) {
         return parse_struct();
     }
-    if (check(TokenType::Def)) {
+    if (check(TokenType::Def) || check(TokenType::Extern)) {
         return parse_func();
     }
-    error(peek(), "Expected declaration ('include', 'struct', or 'def')");
+    error(peek(), "Expected declaration ('include', 'struct', 'def', or 'extern')");
 }
 
 std::unique_ptr<IncludeDirective> Parser::parse_include() {
@@ -109,17 +223,31 @@ std::unique_ptr<StructDecl> Parser::parse_struct() {
 }
 
 std::unique_ptr<FunctionDecl> Parser::parse_func() {
+    bool is_extern = match(TokenType::Extern);
     consume(TokenType::Def, "Expected 'def'");
     const auto &name = consume(TokenType::Identifier, "Expected function name");
     consume(TokenType::LeftParen, "Expected '(' after function name");
 
     std::vector<std::unique_ptr<Param>> params;
+    bool is_vararg = false;
     if (!check(TokenType::RightParen)) {
         do {
+            if (match(TokenType::Ellipsis)) {
+                is_vararg = true;
+                break;
+            }
             auto param_type = parse_type();
             const auto &param_name = consume(TokenType::Identifier, "Expected parameter name");
             params.push_back(std::make_unique<Param>(std::move(param_type), param_name.lexeme));
-        } while (match(TokenType::Comma));
+            if (match(TokenType::Comma)) {
+                if (match(TokenType::Ellipsis)) {
+                    is_vararg = true;
+                    break;
+                }
+            } else {
+                break;
+            }
+        } while (!check(TokenType::RightParen) && !is_at_end());
     }
 
     consume(TokenType::RightParen, "Expected ')' after parameters");
@@ -129,8 +257,17 @@ std::unique_ptr<FunctionDecl> Parser::parse_func() {
         ret_type = parse_type();
     }
 
+    if (is_extern) {
+        consume(TokenType::Semicolon, "Expected ';' after extern function declaration");
+        auto fn = std::make_unique<FunctionDecl>(name.lexeme, std::move(params), std::move(ret_type), nullptr, true, is_vararg);
+        fn->set_loc(loc_for(name));
+        return fn;
+    }
+
     auto body = parse_block();
-    return std::make_unique<FunctionDecl>(name.lexeme, std::move(params), std::move(ret_type), std::move(body));
+    auto fn = std::make_unique<FunctionDecl>(name.lexeme, std::move(params), std::move(ret_type), std::move(body), false, is_vararg);
+    fn->set_loc(loc_for(name));
+    return fn;
 }
 
 bool Parser::is_type_start() const {
@@ -151,6 +288,7 @@ bool Parser::is_type_start() const {
     case TokenType::F64:
     case TokenType::Bool:
     case TokenType::Char:
+    case TokenType::String:
     case TokenType::Void:
     case TokenType::List:
     case TokenType::Identifier:
@@ -178,6 +316,7 @@ bool Parser::is_var_decl() const {
     case TokenType::F64:
     case TokenType::Bool:
     case TokenType::Char:
+    case TokenType::String:
     case TokenType::Void:
     case TokenType::List:
         return true;
@@ -243,6 +382,8 @@ std::unique_ptr<Type> Parser::parse_base_type() {
         return std::make_unique<PrimitiveType>(PrimitiveKind::Bool);
     if (match(TokenType::Char))
         return std::make_unique<PrimitiveType>(PrimitiveKind::Char);
+    if (match(TokenType::String))
+        return std::make_unique<PrimitiveType>(PrimitiveKind::String);
     if (match(TokenType::Void))
         return std::make_unique<PrimitiveType>(PrimitiveKind::Void);
 

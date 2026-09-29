@@ -29,6 +29,8 @@ std::string_view token_type_str(TokenType type) {
         return ";";
     case TokenType::Colon:
         return ":";
+    case TokenType::Ellipsis:
+        return "...";
     case TokenType::Plus:
         return "+";
     case TokenType::Minus:
@@ -91,6 +93,8 @@ std::string_view token_type_str(TokenType type) {
         return "struct";
     case TokenType::Def:
         return "def";
+    case TokenType::Extern:
+        return "extern";
     case TokenType::Return:
         return "return";
     case TokenType::Defer:
@@ -145,6 +149,8 @@ std::string_view token_type_str(TokenType type) {
         return "bool";
     case TokenType::Char:
         return "char";
+    case TokenType::String:
+        return "string";
     case TokenType::Void:
         return "void";
     }
@@ -247,6 +253,7 @@ Token Lexer::lex_ident() {
         {"include", TokenType::Include},
         {"struct", TokenType::Struct},
         {"def", TokenType::Def},
+        {"extern", TokenType::Extern},
         {"return", TokenType::Return},
         {"defer", TokenType::Defer},
         {"if", TokenType::If},
@@ -274,6 +281,7 @@ Token Lexer::lex_ident() {
         {"f64", TokenType::F64},
         {"bool", TokenType::Bool},
         {"char", TokenType::Char},
+        {"string", TokenType::String},
         {"void", TokenType::Void}};
 
     auto it = keywords.find(text);
@@ -433,7 +441,13 @@ std::vector<Token> Lexer::tokenize() {
             tokens.push_back(make_token(TokenType::Comma));
             break;
         case '.':
-            tokens.push_back(make_token(TokenType::Dot));
+            if (peek() == '.' && peek_next() == '.') {
+                advance();
+                advance();
+                tokens.push_back(make_token(TokenType::Ellipsis, "..."));
+            } else {
+                tokens.push_back(make_token(TokenType::Dot));
+            }
             break;
         case ';':
             tokens.push_back(make_token(TokenType::Semicolon));

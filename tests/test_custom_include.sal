@@ -1,0 +1,11 @@
+include "std/io"
+include "my_math"
+include "my_math.sal"
+
+def main() -> int {
+    int sq = square(5);
+    int cb = cube(3);
+    printf("square(5) = %d\n", sq);
+    printf("cube(3) = %d\n", cb);
+    return 0;
+}

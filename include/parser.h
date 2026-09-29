@@ -7,11 +7,19 @@
 #include <string>
 #include <vector>
 
+#include <unordered_set>
+
+class SourceManager;
+
 class ParseError final : public std::runtime_error {
 public:
-    ParseError(SourceLoc loc, const std::string &message)
+    ParseError(SourceLoc loc, const std::string &message,
+               std::vector<std::string> notes = {},
+               std::vector<std::string> suggestions = {})
         : std::runtime_error(message),
-          loc_(std::move(loc)) {}
+          loc_(std::move(loc)),
+          notes_(std::move(notes)),
+          suggestions_(std::move(suggestions)) {}
 
     ParseError(size_t line, size_t col, const std::string &message)
         : ParseError(SourceLoc{"<stdin>", line, col, 1}, message) {}
@@ -19,14 +27,21 @@ public:
     const SourceLoc &loc() const { return loc_; }
     size_t line() const { return loc_.line; }
     size_t col() const { return loc_.col; }
+    const std::vector<std::string> &notes() const { return notes_; }
+    const std::vector<std::string> &suggestions() const { return suggestions_; }
 
 private:
     SourceLoc loc_;
+    std::vector<std::string> notes_;
+    std::vector<std::string> suggestions_;
 };
 
 class Parser {
 public:
-    explicit Parser(std::vector<Token> tokens, std::string filename = "<stdin>");
+    explicit Parser(std::vector<Token> tokens,
+                    std::string filename = "<stdin>",
+                    SourceManager *source_mgr = nullptr,
+                    std::unordered_set<std::string> *included_files = nullptr);
 
     std::unique_ptr<Program> parse_program();
 
@@ -76,9 +91,15 @@ private:
     SourceLoc loc_for(const Token &token) const {
         return SourceLoc{filename_, token.line, token.col, token.lexeme.size()};
     }
-    [[noreturn]] void error(const Token &token, const std::string &message) const;
+    void parse_include_and_merge(std::vector<std::unique_ptr<Decl>> &decls);
+    [[noreturn]] void error(const Token &token, const std::string &message,
+                            const std::vector<std::string> &notes = {},
+                            const std::vector<std::string> &suggestions = {}) const;
 
     std::vector<Token> tokens_;
     size_t current_{0};
     std::string filename_{"<stdin>"};
+    SourceManager *source_mgr_{nullptr};
+    std::unordered_set<std::string> default_included_files_;
+    std::unordered_set<std::string> *included_files_{nullptr};
 };

@@ -61,11 +61,12 @@ void LLVMCodegen::pop_scope() {
 }
 
 bool LLVMCodegen::declare_symbol(const std::string &name,
-                                 llvm::AllocaInst *inst, llvm::Type *type) {
+                                 llvm::AllocaInst *inst, llvm::Type *type,
+                                 const Type *ast_type) {
     if (scopes_.empty()) {
         return false;
     }
-    scopes_.back()[name] = LLVMSymbol{name, inst, type};
+    scopes_.back()[name] = LLVMSymbol{name, inst, type, ast_type};
     return true;
 }
 
@@ -90,6 +91,8 @@ llvm::Type *LLVMCodegen::to_llvm_type(PrimitiveKind kind) {
     case PrimitiveKind::U8:
     case PrimitiveKind::Char:
         return llvm::Type::getInt8Ty(ctx_);
+    case PrimitiveKind::String:
+        return llvm::PointerType::getUnqual(ctx_);
     case PrimitiveKind::I16:
     case PrimitiveKind::U16:
         return llvm::Type::getInt16Ty(ctx_);
@@ -254,7 +257,123 @@ void LLVMCodegen::emit_push_definition() {
     current_func_ = prev_func;
 }
 
+llvm::Function *LLVMCodegen::get_or_create_strcat() {
+    llvm::Type *ptr_ty = llvm::PointerType::getUnqual(ctx_);
+    llvm::Type *i64_ty = llvm::Type::getInt64Ty(ctx_);
+    llvm::Type *i8_ty = llvm::Type::getInt8Ty(ctx_);
+
+    llvm::Function *strcat_fn = module_->getFunction("salmon_strcat");
+    if (strcat_fn && !strcat_fn->isDeclaration()) {
+        return strcat_fn;
+    }
+    if (!strcat_fn) {
+        llvm::FunctionType *fn_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, ptr_ty}, false);
+        strcat_fn = llvm::Function::Create(fn_ty, llvm::Function::InternalLinkage, "salmon_strcat", *module_);
+    }
+
+    if (!module_->getFunction("strlen")) {
+        llvm::FunctionType *strlen_ty = llvm::FunctionType::get(i64_ty, {ptr_ty}, false);
+        llvm::Function::Create(strlen_ty, llvm::Function::ExternalLinkage, "strlen", *module_);
+    }
+    if (!module_->getFunction("malloc")) {
+        llvm::FunctionType *malloc_ty = llvm::FunctionType::get(ptr_ty, {i64_ty}, false);
+        llvm::Function::Create(malloc_ty, llvm::Function::ExternalLinkage, "malloc", *module_);
+    }
+    if (!module_->getFunction("memcpy")) {
+        llvm::FunctionType *memcpy_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, ptr_ty, i64_ty}, false);
+        llvm::Function::Create(memcpy_ty, llvm::Function::ExternalLinkage, "memcpy", *module_);
+    }
+
+    llvm::BasicBlock *prev_block = builder_.GetInsertBlock();
+    llvm::Function *prev_func = current_func_;
+
+    llvm::BasicBlock *entry_bb = llvm::BasicBlock::Create(ctx_, "entry", strcat_fn);
+    builder_.SetInsertPoint(entry_bb);
+
+    auto it = strcat_fn->arg_begin();
+    llvm::Value *s1 = &*it++;
+    s1->setName("s1");
+    llvm::Value *s2 = &*it++;
+    s2->setName("s2");
+
+    llvm::Function *strlen_fn = module_->getFunction("strlen");
+    llvm::Function *malloc_fn = module_->getFunction("malloc");
+    llvm::Function *memcpy_fn = module_->getFunction("memcpy");
+
+    llvm::Value *len1 = builder_.CreateCall(strlen_fn, {s1}, "len1");
+    llvm::Value *len2 = builder_.CreateCall(strlen_fn, {s2}, "len2");
+    llvm::Value *sum_len = builder_.CreateAdd(len1, len2, "sum_len");
+    llvm::Value *total_len = builder_.CreateAdd(sum_len, llvm::ConstantInt::get(i64_ty, 1), "total_len");
+    llvm::Value *buf = builder_.CreateCall(malloc_fn, {total_len}, "buf");
+    builder_.CreateCall(memcpy_fn, {buf, s1, len1});
+    llvm::Value *buf2 = builder_.CreateGEP(i8_ty, buf, len1, "buf2");
+    builder_.CreateCall(memcpy_fn, {buf2, s2, len2});
+    llvm::Value *buf_end = builder_.CreateGEP(i8_ty, buf, sum_len, "buf_end");
+    builder_.CreateStore(llvm::ConstantInt::get(i8_ty, 0), buf_end);
+    builder_.CreateRet(buf);
+
+    if (prev_block) {
+        builder_.SetInsertPoint(prev_block);
+    }
+    current_func_ = prev_func;
+
+    return strcat_fn;
+}
+
+const Type *LLVMCodegen::infer_type(const Expr &expr) const {
+    if (const auto *ident = dynamic_cast<const IdentifierExpr *>(&expr)) {
+        const LLVMSymbol *sym = lookup_symbol(ident->name());
+        if (sym) {
+            return sym->ast_type;
+        }
+        return nullptr;
+    }
+    if (dynamic_cast<const StringLiteralExpr *>(&expr)) {
+        static const PrimitiveType str_type(PrimitiveKind::String);
+        return &str_type;
+    }
+    if (const auto *call = dynamic_cast<const CallExpr *>(&expr)) {
+        std::string callee_name;
+        if (const auto *ident = dynamic_cast<const IdentifierExpr *>(&call->callee())) {
+            callee_name = ident->name();
+        } else if (const auto *mem = dynamic_cast<const MemberAccessExpr *>(&call->callee())) {
+            callee_name = mem->member();
+        }
+        if (!callee_name.empty()) {
+            auto it = func_ret_types_.find(callee_name);
+            if (it != func_ret_types_.end()) {
+                return it->second;
+            }
+        }
+        return nullptr;
+    }
+    if (const auto *bin = dynamic_cast<const BinaryExpr *>(&expr)) {
+        if (bin->op() == BinaryOp::Add && (is_string_type(bin->left()) || is_string_type(bin->right()))) {
+            static const PrimitiveType str_type(PrimitiveKind::String);
+            return &str_type;
+        }
+        return infer_type(bin->left());
+    }
+    return nullptr;
+}
+
+bool LLVMCodegen::is_string_type(const Expr &expr) const {
+    const Type *t = infer_type(expr);
+    if (!t) {
+        return false;
+    }
+    if (const auto *prim = dynamic_cast<const PrimitiveType *>(t)) {
+        return prim->kind() == PrimitiveKind::String;
+    }
+    return false;
+}
+
 void LLVMCodegen::visit(const Program &node) {
+    for (const auto &decl : node.decls()) {
+        if (const auto *fn = dynamic_cast<const FunctionDecl *>(decl.get())) {
+            func_ret_types_[fn->name()] = fn->ret_type();
+        }
+    }
     emit_runtime_decls();
     emit_push_definition();
     for (const auto &decl : node.decls()) {
@@ -263,41 +382,7 @@ void LLVMCodegen::visit(const Program &node) {
 }
 
 void LLVMCodegen::visit(const IncludeDirective &node) {
-    const std::string &path = node.path();
-
-    static const std::unordered_set<std::string> known_std_modules = {
-        "std/io",
-        "std/mem",
-        "std/list"
-    };
-
-    if (known_std_modules.find(path) != known_std_modules.end()) {
-        return;
-    }
-
-    if (path.rfind("std/", 0) == 0) {
-        std::vector<std::string> candidates(known_std_modules.begin(), known_std_modules.end());
-        std::string sim = DiagnosticEngine::find_similar(path, candidates);
-        std::vector<std::string> suggestions;
-        if (!sim.empty()) {
-            suggestions.push_back("did you mean '" + sim + "'?");
-        }
-        error(node.loc(), "unknown standard library module '" + path + "'", {}, suggestions);
-    }
-
-    std::error_code ec;
-    if (std::filesystem::exists(path, ec)) {
-        return;
-    }
-
-    if (!node.loc().file.empty() && node.loc().file != "<stdin>") {
-        std::filesystem::path src_dir = std::filesystem::path(node.loc().file).parent_path();
-        if (!src_dir.empty() && std::filesystem::exists(src_dir / path, ec)) {
-            return;
-        }
-    }
-
-    error(node.loc(), "cannot find include file '" + path + "'");
+    (void)node;
 }
 
 void LLVMCodegen::visit(const StructField &node) { (void)node; }
@@ -337,9 +422,22 @@ void LLVMCodegen::visit(const FunctionDecl &node) {
     llvm::Type *ret_t = node.ret_type() ? to_llvm_type(*node.ret_type())
                                         : llvm::Type::getVoidTy(ctx_);
     llvm::FunctionType *func_t =
-        llvm::FunctionType::get(ret_t, param_types, false);
-    llvm::Function *func = llvm::Function::Create(
-        func_t, llvm::Function::ExternalLinkage, node.name(), *module_);
+        llvm::FunctionType::get(ret_t, param_types, node.is_vararg());
+
+    llvm::Function *func = module_->getFunction(node.name());
+    if (node.is_extern()) {
+        if (!func) {
+            llvm::Function::Create(func_t, llvm::Function::ExternalLinkage, node.name(), *module_);
+        }
+        return;
+    }
+
+    if (!func) {
+        func = llvm::Function::Create(
+            func_t, llvm::Function::ExternalLinkage, node.name(), *module_);
+    } else if (!func->isDeclaration()) {
+        error(node.loc(), "redefinition of function '" + node.name() + "'");
+    }
 
     size_t idx = 0;
     for (auto &arg : func->args()) {
@@ -352,14 +450,17 @@ void LLVMCodegen::visit(const FunctionDecl &node) {
     llvm::BasicBlock *entry_bb = llvm::BasicBlock::Create(ctx_, "entry", func);
     builder_.SetInsertPoint(entry_bb);
 
+    idx = 0;
     for (auto &arg : func->args()) {
         llvm::AllocaInst *alloca =
             builder_.CreateAlloca(arg.getType(), nullptr, arg.getName() + ".addr");
         builder_.CreateStore(&arg, alloca);
-        declare_symbol(std::string(arg.getName()), alloca, arg.getType());
+        declare_symbol(std::string(arg.getName()), alloca, arg.getType(), &node.params()[idx++]->type());
     }
 
-    node.body().accept(*this);
+    if (node.body()) {
+        node.body()->accept(*this);
+    }
 
     if (!builder_.GetInsertBlock()->getTerminator()) {
         for (auto it = defer_stack_.rbegin(); it != defer_stack_.rend(); ++it) {
@@ -387,7 +488,7 @@ void LLVMCodegen::visit(const VarDeclStmt &node) {
     llvm::Type *decl_ty = to_llvm_type(node.type());
     llvm::AllocaInst *alloca =
         builder_.CreateAlloca(decl_ty, nullptr, node.name());
-    declare_symbol(node.name(), alloca, decl_ty);
+    declare_symbol(node.name(), alloca, decl_ty, &node.type());
 
     if (node.init()) {
         node.init()->accept(*this);
@@ -464,6 +565,9 @@ void LLVMCodegen::visit(const AssignStmt &node) {
         llvm::Value *index_val = last_val_;
 
         llvm::Type *elem_type = llvm::Type::getInt32Ty(ctx_);
+        if (is_string_type(idx->object())) {
+            elem_type = llvm::Type::getInt8Ty(ctx_);
+        }
         dest_ptr = builder_.CreateGEP(elem_type, base_ptr, index_val, "elem_ptr");
         dest_type = elem_type;
     }
@@ -664,6 +768,34 @@ void LLVMCodegen::visit(const BinaryExpr &node) {
 
     node.right().accept(*this);
     auto *rhs = last_val_;
+
+    if (node.op() == BinaryOp::Add && (is_string_type(node.left()) || is_string_type(node.right()))) {
+        last_val_ = builder_.CreateCall(get_or_create_strcat(), {lhs, rhs}, "strcat_tmp");
+        return;
+    }
+
+    if ((node.op() == BinaryOp::Equal || node.op() == BinaryOp::NotEqual) &&
+        (is_string_type(node.left()) || is_string_type(node.right()))) {
+        bool left_null = dynamic_cast<const NullLiteralExpr *>(&node.left()) != nullptr;
+        bool right_null = dynamic_cast<const NullLiteralExpr *>(&node.right()) != nullptr;
+        if (!left_null && !right_null) {
+            if (!module_->getFunction("strcmp")) {
+                llvm::FunctionType *strcmp_ty = llvm::FunctionType::get(
+                    llvm::Type::getInt32Ty(ctx_),
+                    {llvm::PointerType::getUnqual(ctx_), llvm::PointerType::getUnqual(ctx_)},
+                    false);
+                llvm::Function::Create(strcmp_ty, llvm::Function::ExternalLinkage, "strcmp", *module_);
+            }
+            llvm::Function *strcmp_fn = module_->getFunction("strcmp");
+            llvm::Value *cmp_res = builder_.CreateCall(strcmp_fn, {lhs, rhs}, "strcmp_res");
+            if (node.op() == BinaryOp::Equal) {
+                last_val_ = builder_.CreateICmpEQ(cmp_res, llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx_), 0), "streq_tmp");
+            } else {
+                last_val_ = builder_.CreateICmpNE(cmp_res, llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx_), 0), "strne_tmp");
+            }
+            return;
+        }
+    }
 
     if (lhs && rhs && lhs->getType()->isIntegerTy() && rhs->getType()->isIntegerTy()) {
         unsigned lhs_bits = lhs->getType()->getIntegerBitWidth();
@@ -980,6 +1112,9 @@ void LLVMCodegen::visit(const IndexExpr &node) {
     }
 
     llvm::Type *elem_ty = llvm::Type::getInt32Ty(ctx_);
+    if (is_string_type(node.object())) {
+        elem_ty = llvm::Type::getInt8Ty(ctx_);
+    }
     llvm::Value *elem_ptr =
         builder_.CreateGEP(elem_ty, buffer, idx, "elem_ptr");
     last_val_ = builder_.CreateLoad(elem_ty, elem_ptr, "elem_val");
@@ -990,6 +1125,18 @@ void LLVMCodegen::visit(const MemberAccessExpr &node) {
     llvm::Value *base = last_val_;
 
     if (node.member() == "len") {
+        if (is_string_type(node.object())) {
+            if (!module_->getFunction("strlen")) {
+                llvm::FunctionType *strlen_ty = llvm::FunctionType::get(
+                    llvm::Type::getInt64Ty(ctx_),
+                    {llvm::PointerType::getUnqual(ctx_)},
+                    false);
+                llvm::Function::Create(strlen_ty, llvm::Function::ExternalLinkage, "strlen", *module_);
+            }
+            llvm::Function *strlen_fn = module_->getFunction("strlen");
+            last_val_ = builder_.CreateCall(strlen_fn, {base}, "strlen_res");
+            return;
+        }
         if (base && base->getType()->isStructTy()) {
             last_val_ = builder_.CreateExtractValue(base, 1, "len");
             return;

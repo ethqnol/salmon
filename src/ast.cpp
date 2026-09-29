@@ -38,6 +38,8 @@ std::string_view primitive_kind_str(PrimitiveKind kind) {
         return "Bool";
     case PrimitiveKind::Char:
         return "Char";
+    case PrimitiveKind::String:
+        return "String";
     case PrimitiveKind::Void:
         return "Void";
     }
@@ -207,6 +209,9 @@ void PrimitiveType::pretty_print(std::ostream &out, int /*indent*/) const {
     case PrimitiveKind::Char:
         out << "char";
         break;
+    case PrimitiveKind::String:
+        out << "string";
+        break;
     case PrimitiveKind::Void:
         out << "void";
         break;
@@ -349,39 +354,61 @@ void FunctionDecl::emit_asdl(std::ostream &out, int indent) const {
     }
     out << ",\n";
     out << indent_str(indent + 1) << "body=";
-    body_->emit_asdl(out, indent + 1);
+    if (body_) {
+        body_->emit_asdl(out, indent + 1);
+    } else {
+        out << "None";
+    }
     out << "\n"
         << indent_str(indent) << ")";
 }
 
 void FunctionDecl::pretty_print(std::ostream &out, int indent) const {
-    out << indent_str(indent) << "def " << name_ << "(";
+    out << indent_str(indent);
+    if (is_extern_) {
+        out << "extern ";
+    }
+    out << "def " << name_ << "(";
     for (size_t i = 0; i < params_.size(); ++i) {
         params_[i]->pretty_print(out);
-        if (i + 1 < params_.size()) {
+        if (i + 1 < params_.size() || is_vararg_) {
             out << ", ";
         }
+    }
+    if (is_vararg_) {
+        out << "...";
     }
     out << ")";
     if (ret_type_) {
         out << " -> ";
         ret_type_->pretty_print(out);
     }
-    out << " ";
-    body_->pretty_print(out, indent);
+    if (body_) {
+        out << " ";
+        body_->pretty_print(out, indent);
+    } else {
+        out << ";";
+    }
 }
 
 void FunctionDecl::print_tree(std::ostream &out, const std::string &prefix, bool is_last) const {
-    out << prefix << (is_last ? "└── " : "├── ") << "FunctionDecl " << name_;
+    out << prefix << (is_last ? "└── " : "├── ");
+    if (is_extern_) {
+        out << "Extern";
+    }
+    out << "FunctionDecl " << name_;
     if (ret_type_) {
         out << " -> " << ret_type_->to_pretty();
     }
     out << "\n";
     std::string next_prefix = prefix + (is_last ? "    " : "│   ");
-    for (const auto &param : params_) {
-        param->print_tree(out, next_prefix, false);
+    for (size_t i = 0; i < params_.size(); ++i) {
+        bool last_param = (i + 1 == params_.size()) && !body_;
+        params_[i]->print_tree(out, next_prefix, last_param);
     }
-    body_->print_tree(out, next_prefix, true);
+    if (body_) {
+        body_->print_tree(out, next_prefix, true);
+    }
 }
 
 void BlockStmt::emit_asdl(std::ostream &out, int indent) const {

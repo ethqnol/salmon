@@ -1,0 +1,20 @@
+include "std/io"
+include "std/math"
+
+extern def atoi(string s) -> int;
+
+def main() -> int {
+    f64 s = sqrt(64.0);
+    printf("sqrt(64.0) = %.1f\n", s);
+
+    f64 p = pow(2.0, 10.0);
+    printf("pow(2, 10) = %.0f\n", p);
+
+    int a = abs(-42);
+    printf("abs(-42) = %d\n", a);
+
+    int parsed = atoi("12345");
+    printf("atoi(\"12345\") = %d\n", parsed);
+
+    return 0;
+}

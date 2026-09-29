@@ -59,10 +59,10 @@ static bool run_compiler(const std::string &src_name,
 
     std::unique_ptr<Program> program;
     try {
-        Parser parser(std::move(tokens), src_name);
+        Parser parser(std::move(tokens), src_name, &source_mgr);
         program = parser.parse_program();
     } catch (const ParseError &e) {
-        diag.error(e.loc(), e.what());
+        diag.error(e.loc(), e.what(), e.notes(), e.suggestions());
         return false;
     }
 

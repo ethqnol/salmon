@@ -1,0 +1,5 @@
+extern def printf(string fmt, ...) -> int;
+extern def puts(string str) -> int;
+extern def putchar(int c) -> int;
+extern def getchar() -> int;
+extern def snprintf(string buf, i64 size, string fmt, ...) -> int;

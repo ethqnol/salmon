@@ -1,0 +1,7 @@
+def square(int x) -> int {
+    return x * x;
+}
+
+def cube(int x) -> int {
+    return x * square(x);
+}

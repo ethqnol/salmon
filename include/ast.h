@@ -32,6 +32,7 @@ enum class PrimitiveKind : uint8_t {
     F64,
     Bool,
     Char,
+    String,
     Void
 };
 
@@ -264,13 +265,22 @@ public:
     FunctionDecl(std::string name,
                  std::vector<std::unique_ptr<Param>> params,
                  std::unique_ptr<Type> ret_type,
-                 std::unique_ptr<BlockStmt> body)
-        : name_(std::move(name)), params_(std::move(params)), ret_type_(std::move(ret_type)), body_(std::move(body)) {}
+                 std::unique_ptr<BlockStmt> body,
+                 bool is_extern = false,
+                 bool is_vararg = false)
+        : name_(std::move(name)),
+          params_(std::move(params)),
+          ret_type_(std::move(ret_type)),
+          body_(std::move(body)),
+          is_extern_(is_extern),
+          is_vararg_(is_vararg) {}
 
     const std::string &name() const { return name_; }
     const std::vector<std::unique_ptr<Param>> &params() const { return params_; }
     const Type *ret_type() const { return ret_type_.get(); }
-    const BlockStmt &body() const { return *body_; }
+    const BlockStmt *body() const { return body_.get(); }
+    bool is_extern() const { return is_extern_; }
+    bool is_vararg() const { return is_vararg_; }
     void accept(ASTVisitor &visitor) const override;
     void emit_asdl(std::ostream &out, int indent = 0) const override;
     void pretty_print(std::ostream &out, int indent = 0) const override;
@@ -281,6 +291,8 @@ private:
     std::vector<std::unique_ptr<Param>> params_;
     std::unique_ptr<Type> ret_type_;
     std::unique_ptr<BlockStmt> body_;
+    bool is_extern_{false};
+    bool is_vararg_{false};
 };
 
 class Stmt : public ASTNode {
@@ -708,6 +720,7 @@ public:
     explicit Program(std::vector<std::unique_ptr<Decl>> decls) : decls_(std::move(decls)) {}
 
     const std::vector<std::unique_ptr<Decl>> &decls() const { return decls_; }
+    std::vector<std::unique_ptr<Decl>> take_decls() { return std::move(decls_); }
     void accept(ASTVisitor &visitor) const override;
     void emit_asdl(std::ostream &out, int indent = 0) const override;
     void pretty_print(std::ostream &out, int indent = 0) const override;

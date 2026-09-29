@@ -1,0 +1,52 @@
+include "std/io"
+
+def main() -> int {
+    string greeting = "Hello";
+    string target = "World";
+    string sep = ", ";
+    string ex = "!";
+
+    string message = greeting + sep + target + ex;
+    printf("Concat: %s\n", message);
+
+    int glen = greeting.len;
+    int mlen = message.len;
+    printf("greeting.len = %d\n", glen);
+    printf("message.len = %d\n", mlen);
+
+    char first = greeting[0];
+    char second = greeting[1];
+    printf("greeting[0] = %c\n", first);
+    printf("greeting[1] = %c\n", second);
+
+    string a = "apple";
+    string b = "apple";
+    string c = "banana";
+
+    if (a == b) {
+        printf("a == b: SUCCESS\n");
+    } else {
+        printf("a == b: FAILURE\n");
+    }
+
+    if (a != c) {
+        printf("a != c: SUCCESS\n");
+    } else {
+        printf("a != c: FAILURE\n");
+    }
+
+    if (a == "apple") {
+        printf("a == 'apple': SUCCESS\n");
+    }
+
+    string null_str = null;
+    if (null_str == null) {
+        printf("null_str == null: SUCCESS\n");
+    }
+
+    if (message != null) {
+        printf("message != null: SUCCESS\n");
+    }
+
+    return 0;
+}
