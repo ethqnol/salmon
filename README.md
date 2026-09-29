@@ -1,0 +1,1 @@
+Salmon is a toy language that uses LLVM-IR
