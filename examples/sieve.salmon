@@ -1,0 +1,61 @@
+include "std/io"
+
+def find_nth_prime(int n) -> int {
+    if (n <= 0) {
+        return 0;
+    }
+
+    int limit = n * 15;
+    if (limit < 30) {
+        limit = 30;
+    }
+
+    list<int> is_prime = list{};
+    for (int i = 0; i < limit; i++) {
+        is_prime.push(1);
+    }
+    is_prime[0] = 0;
+    is_prime[1] = 0;
+
+    for (int p = 2; p * p < limit; p++) {
+        if (is_prime[p] == 1) {
+            for (int m = p * p; m < limit; m += p) {
+                is_prime[m] = 0;
+            }
+        }
+    }
+
+    list<int> primes = list{};
+    for (int k = 2; k < limit; k++) {
+        if (is_prime[k] == 1) {
+            primes.push(k);
+            if (primes.len == n) {
+                return k;
+            }
+        }
+    }
+
+    return 0;
+}
+
+def print_first_n_primes(int count) -> void {
+    printf("First %d prime numbers:\n", count);
+    for (int i = 1; i <= count; i++) {
+        int p = find_nth_prime(i);
+        printf("%d ", p);
+    }
+    printf("\n\n");
+}
+
+def main() -> int {
+    print_first_n_primes(10);
+
+    int[6] test_indices = [1, 5, 10, 25, 50, 100];
+    for (int idx = 0; idx < 6; idx++) {
+        int n = test_indices[idx];
+        int prime = find_nth_prime(n);
+        printf("Prime #%d = %d\n", n, prime);
+    }
+
+    return 0;
+}

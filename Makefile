@@ -13,14 +13,11 @@ TARGET   := salmon
 
 .PHONY: all run clean
 
-# Default target
 all: $(TARGET)
 
-# Link object files into final executable
 $(TARGET): $(OBJS)
 	$(CXX) $(OBJS) $(LLVM_LDFLAGS) -o $@
 
-# Compile source files into objects inside build/
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@

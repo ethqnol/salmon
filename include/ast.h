@@ -1,5 +1,6 @@
 #pragma once
 
+#include "diagnostic.h"
 #include <cstdint>
 #include <memory>
 #include <ostream>
@@ -7,7 +8,6 @@
 #include <string_view>
 #include <vector>
 
-// Forward declarations
 class ASTVisitor;
 class ASTNode;
 class Type;
@@ -81,12 +81,14 @@ enum class PostfixOp : uint8_t {
 
 std::string_view postfix_op_str(PostfixOp op);
 
-// Base AST Node
 class ASTNode {
 public:
     virtual ~ASTNode() = default;
 
     virtual void accept(ASTVisitor &visitor) const = 0;
+
+    const SourceLoc &loc() const { return loc_; }
+    void set_loc(SourceLoc loc) { loc_ = std::move(loc); }
 
     virtual void emit_asdl(std::ostream &out, int indent = 0) const = 0;
     std::string to_asdl(int indent = 0) const;
@@ -96,6 +98,9 @@ public:
 
     virtual void print_tree(std::ostream &out, const std::string &prefix = "", bool is_last = true) const;
     std::string to_tree() const;
+
+private:
+    SourceLoc loc_;
 };
 
 class Type : public ASTNode {
@@ -543,7 +548,6 @@ private:
     std::unique_ptr<Expr> index_;
 };
 
-// Unified member access for both dot (.) and arrow (->)
 class MemberAccessExpr final : public Expr {
 public:
     MemberAccessExpr(std::unique_ptr<Expr> object, std::string member)

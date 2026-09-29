@@ -1,28 +1,50 @@
 #include "codegen/llvm_codegen.h"
+#include <filesystem>
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/Support/raw_ostream.h>
+#include <llvm/TargetParser/Host.h>
 #include <llvm/TargetParser/Triple.h>
+#include <unordered_set>
 
-LLVMCodegen::LLVMCodegen(std::ostream &out)
-    : out_(out), module_(std::make_unique<llvm::Module>("salmon", ctx_)),
+LLVMCodegen::LLVMCodegen(std::ostream &out, DiagnosticEngine *diag)
+    : out_(out),
+      diag_(diag),
+      module_(std::make_unique<llvm::Module>("salmon", ctx_)),
       builder_(ctx_) {
-    module_->setTargetTriple(llvm::Triple("x86_64-pc-linux-gnu"));
+    module_->setTargetTriple(llvm::Triple(llvm::sys::getDefaultTargetTriple()));
     push_scope();
 
     llvm::Type *ptr_ty = llvm::PointerType::getUnqual(ctx_);
     llvm::Type *i64_ty = llvm::Type::getInt64Ty(ctx_);
 
-    // %struct.salmon_slice = type { ptr, i64 }
     llvm::StructType::create(ctx_, {ptr_ty, i64_ty}, "struct.salmon_slice");
-
-    // %struct.salmon_list = type { ptr, i64, i64 }
     llvm::StructType::create(ctx_, {ptr_ty, i64_ty, i64_ty},
                              "struct.salmon_list");
 }
 
+void LLVMCodegen::error(const SourceLoc &loc, const std::string &msg,
+                        const std::vector<std::string> &notes,
+                        const std::vector<std::string> &suggestions) {
+    if (diag_) {
+        diag_->error(loc, msg, notes, suggestions);
+        throw CompileError("Codegen error: " + msg);
+    }
+    throw CompileError("[" + loc.to_string() + "] " + msg);
+}
+
+std::vector<std::string> LLVMCodegen::get_visible_symbols() const {
+    std::vector<std::string> names;
+    for (const auto &scope : scopes_) {
+        for (const auto &[name, sym] : scope) {
+            names.push_back(name);
+        }
+    }
+    return names;
+}
+
 void LLVMCodegen::generate(const Program &program) {
-    program.accept(*this);
     emit_runtime_decls();
+    program.accept(*this);
 
     std::string ir_str;
     llvm::raw_string_ostream rso(ir_str);
@@ -120,7 +142,6 @@ void LLVMCodegen::emit_runtime_decls() {
     llvm::Type *ptr_ty = llvm::PointerType::getUnqual(ctx_);
     llvm::Type *void_ty = llvm::Type::getVoidTy(ctx_);
 
-    // declare i32 @printf(ptr, ...)
     if (!module_->getFunction("printf")) {
         llvm::FunctionType *printf_ty =
             llvm::FunctionType::get(i32_ty, {ptr_ty}, true);
@@ -128,7 +149,6 @@ void LLVMCodegen::emit_runtime_decls() {
                                *module_);
     }
 
-    // declare ptr @malloc(i64)
     if (!module_->getFunction("malloc")) {
         llvm::FunctionType *malloc_ty =
             llvm::FunctionType::get(ptr_ty, {i64_ty}, false);
@@ -136,7 +156,13 @@ void LLVMCodegen::emit_runtime_decls() {
                                *module_);
     }
 
-    // declare void @free(ptr)
+    if (!module_->getFunction("realloc")) {
+        llvm::FunctionType *realloc_ty =
+            llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty}, false);
+        llvm::Function::Create(realloc_ty, llvm::Function::ExternalLinkage,
+                               "realloc", *module_);
+    }
+
     if (!module_->getFunction("free")) {
         llvm::FunctionType *free_ty =
             llvm::FunctionType::get(void_ty, {ptr_ty}, false);
@@ -145,14 +171,134 @@ void LLVMCodegen::emit_runtime_decls() {
     }
 }
 
-// Declarations
+void LLVMCodegen::emit_push_definition() {
+    llvm::Type *ptr_ty = llvm::PointerType::getUnqual(ctx_);
+    llvm::Type *i32_ty = llvm::Type::getInt32Ty(ctx_);
+    llvm::Type *i64_ty = llvm::Type::getInt64Ty(ctx_);
+    llvm::Type *void_ty = llvm::Type::getVoidTy(ctx_);
+    llvm::Type *list_ty =
+        llvm::StructType::getTypeByName(ctx_, "struct.salmon_list");
+
+    llvm::Function *push_fn = module_->getFunction("push");
+    if (push_fn && !push_fn->isDeclaration()) {
+        return;
+    }
+    if (!push_fn) {
+        llvm::FunctionType *push_ty =
+            llvm::FunctionType::get(void_ty, {ptr_ty, i32_ty}, false);
+        push_fn = llvm::Function::Create(
+            push_ty, llvm::Function::ExternalLinkage, "push", *module_);
+    }
+
+    llvm::BasicBlock *prev_block = builder_.GetInsertBlock();
+    llvm::Function *prev_func = current_func_;
+
+    llvm::BasicBlock *entry_bb =
+        llvm::BasicBlock::Create(ctx_, "entry", push_fn);
+    llvm::BasicBlock *grow_bb =
+        llvm::BasicBlock::Create(ctx_, "grow", push_fn);
+    llvm::BasicBlock *store_bb =
+        llvm::BasicBlock::Create(ctx_, "store", push_fn);
+
+    builder_.SetInsertPoint(entry_bb);
+    auto arg_it = push_fn->arg_begin();
+    llvm::Value *list_ptr = &*arg_it++;
+    list_ptr->setName("list");
+    llvm::Value *val = &*arg_it;
+    val->setName("val");
+
+    llvm::Value *data_gep =
+        builder_.CreateStructGEP(list_ty, list_ptr, 0, "data_gep");
+    llvm::Value *len_gep =
+        builder_.CreateStructGEP(list_ty, list_ptr, 1, "len_gep");
+    llvm::Value *cap_gep =
+        builder_.CreateStructGEP(list_ty, list_ptr, 2, "cap_gep");
+
+    llvm::Value *len = builder_.CreateLoad(i64_ty, len_gep, "len");
+    llvm::Value *cap = builder_.CreateLoad(i64_ty, cap_gep, "cap");
+
+    llvm::Value *need_grow = builder_.CreateICmpUGE(len, cap, "need_grow");
+    builder_.CreateCondBr(need_grow, grow_bb, store_bb);
+
+    builder_.SetInsertPoint(grow_bb);
+    llvm::Value *cap_is_zero =
+        builder_.CreateICmpEQ(cap, llvm::ConstantInt::get(i64_ty, 0), "cap_zero");
+    llvm::Value *double_cap =
+        builder_.CreateShl(cap, llvm::ConstantInt::get(i64_ty, 1), "double_cap");
+    llvm::Value *new_cap = builder_.CreateSelect(
+        cap_is_zero, llvm::ConstantInt::get(i64_ty, 4), double_cap, "new_cap");
+    llvm::Value *new_bytes = builder_.CreateMul(
+        new_cap, llvm::ConstantInt::get(i64_ty, sizeof(int32_t)), "new_bytes");
+    llvm::Value *old_data = builder_.CreateLoad(ptr_ty, data_gep, "old_data");
+    llvm::Function *realloc_fn = module_->getFunction("realloc");
+    llvm::Value *new_data =
+        builder_.CreateCall(realloc_fn, {old_data, new_bytes}, "new_data");
+    builder_.CreateStore(new_data, data_gep);
+    builder_.CreateStore(new_cap, cap_gep);
+    builder_.CreateBr(store_bb);
+
+    builder_.SetInsertPoint(store_bb);
+    llvm::Value *cur_data = builder_.CreateLoad(ptr_ty, data_gep, "cur_data");
+    llvm::Value *cur_len = builder_.CreateLoad(i64_ty, len_gep, "cur_len");
+    llvm::Value *slot_ptr =
+        builder_.CreateGEP(i32_ty, cur_data, cur_len, "slot_ptr");
+    builder_.CreateStore(val, slot_ptr);
+    llvm::Value *inc_len =
+        builder_.CreateAdd(cur_len, llvm::ConstantInt::get(i64_ty, 1), "inc_len");
+    builder_.CreateStore(inc_len, len_gep);
+    builder_.CreateRetVoid();
+
+    if (prev_block) {
+        builder_.SetInsertPoint(prev_block);
+    }
+    current_func_ = prev_func;
+}
+
 void LLVMCodegen::visit(const Program &node) {
+    emit_runtime_decls();
+    emit_push_definition();
     for (const auto &decl : node.decls()) {
         decl->accept(*this);
     }
 }
 
-void LLVMCodegen::visit(const IncludeDirective &node) { (void)node; }
+void LLVMCodegen::visit(const IncludeDirective &node) {
+    const std::string &path = node.path();
+
+    static const std::unordered_set<std::string> known_std_modules = {
+        "std/io",
+        "std/mem",
+        "std/list"
+    };
+
+    if (known_std_modules.find(path) != known_std_modules.end()) {
+        return;
+    }
+
+    if (path.rfind("std/", 0) == 0) {
+        std::vector<std::string> candidates(known_std_modules.begin(), known_std_modules.end());
+        std::string sim = DiagnosticEngine::find_similar(path, candidates);
+        std::vector<std::string> suggestions;
+        if (!sim.empty()) {
+            suggestions.push_back("did you mean '" + sim + "'?");
+        }
+        error(node.loc(), "unknown standard library module '" + path + "'", {}, suggestions);
+    }
+
+    std::error_code ec;
+    if (std::filesystem::exists(path, ec)) {
+        return;
+    }
+
+    if (!node.loc().file.empty() && node.loc().file != "<stdin>") {
+        std::filesystem::path src_dir = std::filesystem::path(node.loc().file).parent_path();
+        if (!src_dir.empty() && std::filesystem::exists(src_dir / path, ec)) {
+            return;
+        }
+    }
+
+    error(node.loc(), "cannot find include file '" + path + "'");
+}
 
 void LLVMCodegen::visit(const StructField &node) { (void)node; }
 
@@ -162,7 +308,7 @@ void LLVMCodegen::visit(const StructDecl &node) {
     if (!st) {
         st = llvm::StructType::create(ctx_, sname);
     } else if (!st->isOpaque()) {
-        throw std::runtime_error("Redefinition of struct '" + node.name() + "'");
+        error(node.loc(), "redefinition of struct '" + node.name() + "'");
     }
 
     StructInfo info;
@@ -213,11 +359,12 @@ void LLVMCodegen::visit(const FunctionDecl &node) {
         declare_symbol(std::string(arg.getName()), alloca, arg.getType());
     }
 
-    // Function body
     node.body().accept(*this);
 
-    // If block doesn't have a terminator yet
     if (!builder_.GetInsertBlock()->getTerminator()) {
+        for (auto it = defer_stack_.rbegin(); it != defer_stack_.rend(); ++it) {
+            (*it)->accept(*this);
+        }
         if (ret_t->isVoidTy()) {
             builder_.CreateRetVoid();
         } else {
@@ -225,11 +372,11 @@ void LLVMCodegen::visit(const FunctionDecl &node) {
         }
     }
 
+    defer_stack_.clear();
     pop_scope();
     current_func_ = nullptr;
 }
 
-// Statements
 void LLVMCodegen::visit(const BlockStmt &node) {
     for (const auto &stmt : node.stmts()) {
         stmt->accept(*this);
@@ -237,13 +384,20 @@ void LLVMCodegen::visit(const BlockStmt &node) {
 }
 
 void LLVMCodegen::visit(const VarDeclStmt &node) {
+    llvm::Type *decl_ty = to_llvm_type(node.type());
     llvm::AllocaInst *alloca =
-        builder_.CreateAlloca(to_llvm_type(node.type()), nullptr, node.name());
-    declare_symbol(node.name(), alloca, to_llvm_type(node.type()));
+        builder_.CreateAlloca(decl_ty, nullptr, node.name());
+    declare_symbol(node.name(), alloca, decl_ty);
 
     if (node.init()) {
         node.init()->accept(*this);
-        builder_.CreateStore(last_val_, alloca);
+        llvm::Value *val = last_val_;
+        if (val && val->getType()->isIntegerTy() && decl_ty->isIntegerTy()) {
+            if (val->getType() != decl_ty) {
+                val = builder_.CreateZExtOrTrunc(val, decl_ty, "init_cast");
+            }
+        }
+        builder_.CreateStore(val, alloca);
     }
 }
 
@@ -255,7 +409,13 @@ void LLVMCodegen::visit(const AssignStmt &node) {
             dynamic_cast<const IdentifierExpr *>(&node.target())) {
         const LLVMSymbol *sym = lookup_symbol(ident->name());
         if (!sym) {
-            throw std::runtime_error("Undefined variable: " + ident->name());
+            std::vector<std::string> visible = get_visible_symbols();
+            std::string similar = DiagnosticEngine::find_similar(ident->name(), visible);
+            std::vector<std::string> suggestions;
+            if (!similar.empty()) {
+                suggestions.push_back("did you mean '" + similar + "'?");
+            }
+            error(ident->loc(), "undefined variable '" + ident->name() + "'", {}, suggestions);
         }
         dest_ptr = sym->alloca_inst;
         dest_type = sym->type;
@@ -271,31 +431,49 @@ void LLVMCodegen::visit(const AssignStmt &node) {
         mem->object().accept(*this);
         llvm::Value *base_ptr = last_val_;
 
-        const StructInfo &info = struct_defs_.at("Node");
-        unsigned field_idx = info.field_indices.at(mem->member());
+        const StructInfo *found_info = nullptr;
+        for (const auto &[sname, info] : struct_defs_) {
+            if (info.field_indices.find(mem->member()) != info.field_indices.end()) {
+                found_info = &info;
+                break;
+            }
+        }
 
-        dest_ptr = builder_.CreateStructGEP(info.llvm_type, base_ptr, field_idx,
-                                            mem->member() + "_ptr");
-        dest_type = to_llvm_type(*info.field_types.at(mem->member()));
+        if (found_info) {
+            unsigned field_idx = found_info->field_indices.at(mem->member());
+            dest_ptr = builder_.CreateStructGEP(found_info->llvm_type, base_ptr, field_idx,
+                                                mem->member() + "_ptr");
+            dest_type = to_llvm_type(*found_info->field_types.at(mem->member()));
+        } else {
+            error(mem->loc(), "unknown struct member '" + mem->member() + "'");
+        }
     } else if (const auto *idx =
                    dynamic_cast<const IndexExpr *>(&node.target())) {
         idx->object().accept(*this);
         llvm::Value *base_ptr = last_val_;
+        if (base_ptr && base_ptr->getType()->isStructTy()) {
+            base_ptr = builder_.CreateExtractValue(base_ptr, 0, "buf");
+        } else if (const auto *ident =
+                       dynamic_cast<const IdentifierExpr *>(&idx->object())) {
+            const LLVMSymbol *s = lookup_symbol(ident->name());
+            if (s && s->type->isArrayTy()) {
+                base_ptr = s->alloca_inst;
+            }
+        }
         idx->index().accept(*this);
         llvm::Value *index_val = last_val_;
 
-        llvm::Type *elem_type = llvm::Type::getInt32Ty(ctx_); // element type
+        llvm::Type *elem_type = llvm::Type::getInt32Ty(ctx_);
         dest_ptr = builder_.CreateGEP(elem_type, base_ptr, index_val, "elem_ptr");
         dest_type = elem_type;
     }
 
     if (!dest_ptr) {
-        throw std::runtime_error("Invalid lvalue target in assignment");
+        error(node.target().loc(), "invalid lvalue target in assignment");
     }
 
     node.value().accept(*this);
     llvm::Value *rhs_val = last_val_;
-
     llvm::Value *final_val = rhs_val;
 
     if (node.op() != AssignOp::Assign) {
@@ -303,16 +481,16 @@ void LLVMCodegen::visit(const AssignStmt &node) {
             builder_.CreateLoad(dest_type, dest_ptr, "current_val");
 
         switch (node.op()) {
-        case AssignOp::AddAssign: // x += y -> x = x + y
+        case AssignOp::AddAssign:
             final_val = builder_.CreateAdd(current_val, rhs_val, "add_tmp");
             break;
-        case AssignOp::SubAssign: // x -= y -> x = x - y
+        case AssignOp::SubAssign:
             final_val = builder_.CreateSub(current_val, rhs_val, "sub_tmp");
             break;
-        case AssignOp::MulAssign: // x *= y -> x = x * y
+        case AssignOp::MulAssign:
             final_val = builder_.CreateMul(current_val, rhs_val, "mul_tmp");
             break;
-        case AssignOp::DivAssign: // x /= y -> x = x / y
+        case AssignOp::DivAssign:
             final_val = builder_.CreateSDiv(current_val, rhs_val, "div_tmp");
             break;
         default:
@@ -320,16 +498,23 @@ void LLVMCodegen::visit(const AssignStmt &node) {
         }
     }
 
+    if (final_val && dest_type && final_val->getType()->isIntegerTy() && dest_type->isIntegerTy()) {
+        if (final_val->getType() != dest_type) {
+            final_val = builder_.CreateZExtOrTrunc(final_val, dest_type, "assign_cast");
+        }
+    }
+
     builder_.CreateStore(final_val, dest_ptr);
 }
 
-void LLVMCodegen::visit(const ExprStmt &node) { (void)node; }
+void LLVMCodegen::visit(const ExprStmt &node) {
+    node.expr().accept(*this);
+}
 
 void LLVMCodegen::visit(const IfStmt &node) {
     node.cond().accept(*this);
     llvm::Value *cond_val = last_val_;
 
-    // integer truthy
     if (!cond_val->getType()->isIntegerTy(1)) {
         cond_val = builder_.CreateICmpNE(
             cond_val, llvm::ConstantInt::get(cond_val->getType(), 0), "ifcond");
@@ -447,82 +632,539 @@ void LLVMCodegen::visit(const ForStmt &node) {
 }
 
 void LLVMCodegen::visit(const ReturnStmt &node) {
+    llvm::Value *ret_val = nullptr;
     if (node.value()) {
         node.value()->accept(*this);
-        builder_.CreateRet(last_val_);
+        ret_val = last_val_;
+    }
+
+    for (auto it = defer_stack_.rbegin(); it != defer_stack_.rend(); ++it) {
+        (*it)->accept(*this);
+    }
+
+    if (ret_val) {
+        if (current_func_ && current_func_->getReturnType()->isIntegerTy() &&
+            ret_val->getType()->isIntegerTy() &&
+            ret_val->getType() != current_func_->getReturnType()) {
+            ret_val = builder_.CreateZExtOrTrunc(ret_val, current_func_->getReturnType(), "ret_cast");
+        }
+        builder_.CreateRet(ret_val);
     } else {
         builder_.CreateRetVoid();
     }
 }
 
-void LLVMCodegen::visit(const DeferStmt &node) { (void)node; }
+void LLVMCodegen::visit(const DeferStmt &node) {
+    defer_stack_.push_back(&node.stmt());
+}
 
-// Expressions
 void LLVMCodegen::visit(const BinaryExpr &node) {
     node.left().accept(*this);
     auto *lhs = last_val_;
 
     node.right().accept(*this);
     auto *rhs = last_val_;
+
+    if (lhs && rhs && lhs->getType()->isIntegerTy() && rhs->getType()->isIntegerTy()) {
+        unsigned lhs_bits = lhs->getType()->getIntegerBitWidth();
+        unsigned rhs_bits = rhs->getType()->getIntegerBitWidth();
+        if (lhs_bits < rhs_bits) {
+            lhs = builder_.CreateSExt(lhs, rhs->getType(), "sext_lhs");
+        } else if (rhs_bits < lhs_bits) {
+            rhs = builder_.CreateSExt(rhs, lhs->getType(), "sext_rhs");
+        }
+    }
+
     switch (node.op()) {
     case BinaryOp::Add:
-        last_val_ = builder_.CreateAdd(lhs, rhs);
+        last_val_ = builder_.CreateAdd(lhs, rhs, "add_tmp");
         break;
-
     case BinaryOp::Sub:
-        last_val_ = builder_.CreateSub(lhs, rhs);
+        last_val_ = builder_.CreateSub(lhs, rhs, "sub_tmp");
         break;
-
     case BinaryOp::Mul:
-        last_val_ = builder_.CreateMul(lhs, rhs);
+        last_val_ = builder_.CreateMul(lhs, rhs, "mul_tmp");
         break;
-
     case BinaryOp::Div:
-        last_val_ = builder_.CreateSDiv(lhs, rhs);
+        last_val_ = builder_.CreateSDiv(lhs, rhs, "div_tmp");
+        break;
+    case BinaryOp::Mod:
+        last_val_ = builder_.CreateSRem(lhs, rhs, "mod_tmp");
+        break;
+    case BinaryOp::Equal:
+        last_val_ = builder_.CreateICmpEQ(lhs, rhs, "eq_tmp");
+        break;
+    case BinaryOp::NotEqual:
+        last_val_ = builder_.CreateICmpNE(lhs, rhs, "ne_tmp");
+        break;
+    case BinaryOp::Less:
+        last_val_ = builder_.CreateICmpSLT(lhs, rhs, "lt_tmp");
+        break;
+    case BinaryOp::LessEqual:
+        last_val_ = builder_.CreateICmpSLE(lhs, rhs, "le_tmp");
+        break;
+    case BinaryOp::Greater:
+        last_val_ = builder_.CreateICmpSGT(lhs, rhs, "gt_tmp");
+        break;
+    case BinaryOp::GreaterEqual:
+        last_val_ = builder_.CreateICmpSGE(lhs, rhs, "ge_tmp");
+        break;
+    case BinaryOp::LogicalAnd:
+        last_val_ = builder_.CreateLogicalAnd(lhs, rhs, "and_tmp");
+        break;
+    case BinaryOp::LogicalOr:
+        last_val_ = builder_.CreateLogicalOr(lhs, rhs, "or_tmp");
         break;
     }
 }
 
-void LLVMCodegen::visit(const UnaryExpr &node) { (void)node; }
+void LLVMCodegen::visit(const UnaryExpr &node) {
+    switch (node.op()) {
+    case UnaryOp::LogicalNot: {
+        node.operand().accept(*this);
+        llvm::Value *val = last_val_;
+        if (!val->getType()->isIntegerTy(1)) {
+            val = builder_.CreateICmpNE(
+                val, llvm::ConstantInt::get(val->getType(), 0), "not_cond");
+        }
+        last_val_ = builder_.CreateNot(val, "lnot_tmp");
+        break;
+    }
+    case UnaryOp::Negate: {
+        node.operand().accept(*this);
+        last_val_ = builder_.CreateNeg(last_val_, "neg_tmp");
+        break;
+    }
+    case UnaryOp::AddressOf: {
+        if (const auto *ident =
+                dynamic_cast<const IdentifierExpr *>(&node.operand())) {
+            const LLVMSymbol *s = lookup_symbol(ident->name());
+            if (!s) {
+                std::vector<std::string> visible = get_visible_symbols();
+                std::string similar =
+                    DiagnosticEngine::find_similar(ident->name(), visible);
+                std::vector<std::string> suggestions;
+                if (!similar.empty()) {
+                    suggestions.push_back("did you mean '" + similar + "'?");
+                }
+                error(ident->loc(), "undefined variable '" + ident->name() + "'",
+                      {}, suggestions);
+            }
+            last_val_ = s->alloca_inst;
+        } else {
+            error(node.loc(), "cannot take address of non-lvalue");
+        }
+        break;
+    }
+    case UnaryOp::Dereference: {
+        node.operand().accept(*this);
+        last_val_ = builder_.CreateLoad(llvm::Type::getInt32Ty(ctx_), last_val_,
+                                        "deref_tmp");
+        break;
+    }
+    }
+}
 
-void LLVMCodegen::visit(const SizeofExpr &node) { (void)node; }
+void LLVMCodegen::visit(const SizeofExpr &node) {
+    const llvm::DataLayout &dl = module_->getDataLayout();
+    llvm::Type *target_ty = nullptr;
 
-void LLVMCodegen::visit(const PostfixUpdateExpr &node) { (void)node; }
+    if (const auto *ident =
+            dynamic_cast<const IdentifierExpr *>(&node.operand())) {
+        const std::string &name = ident->name();
 
-void LLVMCodegen::visit(const CallExpr &node) { (void)node; }
+        if (name == "int" || name == "i32" || name == "uint" || name == "u32") {
+            target_ty = llvm::Type::getInt32Ty(ctx_);
+        } else if (name == "i64" || name == "u64") {
+            target_ty = llvm::Type::getInt64Ty(ctx_);
+        } else if (name == "i16" || name == "u16") {
+            target_ty = llvm::Type::getInt16Ty(ctx_);
+        } else if (name == "i8" || name == "u8" || name == "char") {
+            target_ty = llvm::Type::getInt8Ty(ctx_);
+        } else if (name == "float" || name == "f32") {
+            target_ty = llvm::Type::getFloatTy(ctx_);
+        } else if (name == "f64") {
+            target_ty = llvm::Type::getDoubleTy(ctx_);
+        } else if (name == "bool") {
+            target_ty = llvm::Type::getInt1Ty(ctx_);
+        } else if (struct_defs_.find(name) != struct_defs_.end()) {
+            target_ty = struct_defs_.at(name).llvm_type;
+        } else if (auto *st = llvm::StructType::getTypeByName(ctx_, "struct." + name)) {
+            target_ty = st;
+        } else if (const LLVMSymbol *sym = lookup_symbol(name)) {
+            target_ty = sym->type;
+        } else {
+            std::vector<std::string> candidates = get_visible_symbols();
+            for (const auto &[sname, _] : struct_defs_) {
+                candidates.push_back(sname);
+            }
+            std::string sim = DiagnosticEngine::find_similar(name, candidates);
+            std::vector<std::string> suggestions;
+            if (!sim.empty()) {
+                suggestions.push_back("did you mean '" + sim + "'?");
+            }
+            error(ident->loc(), "unknown type or variable '" + name + "' in sizeof",
+                  {}, suggestions);
+        }
+    } else {
+        node.operand().accept(*this);
+        if (last_val_) {
+            target_ty = last_val_->getType();
+        }
+    }
 
-void LLVMCodegen::visit(const IndexExpr &node) { (void)node; }
+    if (!target_ty) {
+        error(node.loc(), "cannot determine type for sizeof expression");
+    }
 
-void LLVMCodegen::visit(const MemberAccessExpr &node) { (void)node; }
+    uint64_t size_bytes = dl.getTypeAllocSize(target_ty);
+    last_val_ = llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx_), size_bytes);
+}
+
+void LLVMCodegen::visit(const PostfixUpdateExpr &node) {
+    if (const auto *ident =
+            dynamic_cast<const IdentifierExpr *>(&node.operand())) {
+        const LLVMSymbol *s = lookup_symbol(ident->name());
+        if (!s) {
+            std::vector<std::string> visible = get_visible_symbols();
+            std::string similar =
+                DiagnosticEngine::find_similar(ident->name(), visible);
+            std::vector<std::string> suggestions;
+            if (!similar.empty()) {
+                suggestions.push_back("did you mean '" + similar + "'?");
+            }
+            error(ident->loc(), "undefined variable '" + ident->name() + "'",
+                  {}, suggestions);
+        }
+        llvm::Value *cur = builder_.CreateLoad(s->type, s->alloca_inst, "cur");
+        llvm::Value *step = llvm::ConstantInt::get(s->type, 1);
+        llvm::Value *updated = nullptr;
+        if (node.op() == PostfixOp::PostIncrement) {
+            updated = builder_.CreateAdd(cur, step, "inc");
+        } else {
+            updated = builder_.CreateSub(cur, step, "dec");
+        }
+        builder_.CreateStore(updated, s->alloca_inst);
+        last_val_ = cur;
+    } else {
+        error(node.loc(), "postfix ++ / -- only supported on variables");
+    }
+}
+
+void LLVMCodegen::visit(const CallExpr &node) {
+    std::string callee_name;
+    std::vector<llvm::Value *> args;
+
+    if (const auto *ident =
+            dynamic_cast<const IdentifierExpr *>(&node.callee())) {
+        callee_name = ident->name();
+    } else if (const auto *mem =
+                   dynamic_cast<const MemberAccessExpr *>(&node.callee())) {
+        callee_name = mem->member();
+        if (const auto *obj_id =
+                dynamic_cast<const IdentifierExpr *>(&mem->object())) {
+            const LLVMSymbol *s = lookup_symbol(obj_id->name());
+            if (s) {
+                llvm::Type *list_ty =
+                    llvm::StructType::getTypeByName(ctx_, "struct.salmon_list");
+                if (callee_name == "free" && s->type == list_ty) {
+                    llvm::Value *data_gep =
+                        builder_.CreateStructGEP(list_ty, s->alloca_inst, 0, "list_data_ptr");
+                    llvm::Value *data_val =
+                        builder_.CreateLoad(llvm::PointerType::getUnqual(ctx_), data_gep, "list_data");
+                    llvm::Function *free_fn = module_->getFunction("free");
+                    builder_.CreateCall(free_fn, {data_val});
+                    builder_.CreateStore(
+                        llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)),
+                        data_gep);
+                    llvm::Value *len_gep =
+                        builder_.CreateStructGEP(list_ty, s->alloca_inst, 1, "list_len_ptr");
+                    builder_.CreateStore(
+                        llvm::ConstantInt::get(llvm::Type::getInt64Ty(ctx_), 0), len_gep);
+                    llvm::Value *cap_gep =
+                        builder_.CreateStructGEP(list_ty, s->alloca_inst, 2, "list_cap_ptr");
+                    builder_.CreateStore(
+                        llvm::ConstantInt::get(llvm::Type::getInt64Ty(ctx_), 0), cap_gep);
+                    last_val_ = nullptr;
+                    return;
+                }
+                args.push_back(s->alloca_inst);
+            }
+        }
+    } else {
+        error(node.loc(), "complex callee expressions are not supported");
+    }
+
+    llvm::Function *callee_fn = module_->getFunction(callee_name);
+    if (!callee_fn) {
+        std::vector<std::string> fn_names;
+        for (const auto &f : module_->functions()) {
+            fn_names.push_back(f.getName().str());
+        }
+        std::string sim = DiagnosticEngine::find_similar(callee_name, fn_names);
+        std::vector<std::string> suggestions;
+        if (!sim.empty()) {
+            suggestions.push_back("did you mean '" + sim + "'?");
+        }
+        error(node.callee().loc(),
+              "call to undefined function '" + callee_name + "'", {},
+              suggestions);
+    }
+
+    for (size_t i = 0; i < node.args().size(); ++i) {
+        node.args()[i]->accept(*this);
+        llvm::Value *arg_val = last_val_;
+
+        if (callee_fn && i < callee_fn->getFunctionType()->getNumParams()) {
+            llvm::Type *param_ty = callee_fn->getFunctionType()->getParamType(i);
+            llvm::Type *slice_ty =
+                llvm::StructType::getTypeByName(ctx_, "struct.salmon_slice");
+
+            if (param_ty == slice_ty && arg_val && arg_val->getType()->isArrayTy()) {
+                llvm::ArrayType *arr_t =
+                    llvm::cast<llvm::ArrayType>(arg_val->getType());
+                uint64_t arr_len = arr_t->getNumElements();
+
+                llvm::Value *first_elem_ptr = nullptr;
+                if (const auto *ident =
+                        dynamic_cast<const IdentifierExpr *>(node.args()[i].get())) {
+                    const LLVMSymbol *s = lookup_symbol(ident->name());
+                    if (s) {
+                        first_elem_ptr = s->alloca_inst;
+                    }
+                }
+                if (!first_elem_ptr) {
+                    llvm::AllocaInst *tmp_arr = builder_.CreateAlloca(
+                        arr_t, nullptr, "arr_slice_tmp");
+                    builder_.CreateStore(arg_val, tmp_arr);
+                    first_elem_ptr = tmp_arr;
+                }
+
+                llvm::Value *slice_val = llvm::UndefValue::get(slice_ty);
+                slice_val = builder_.CreateInsertValue(slice_val, first_elem_ptr, 0, "s_ptr");
+                llvm::Value *len_val = llvm::ConstantInt::get(
+                    llvm::Type::getInt64Ty(ctx_), arr_len);
+                slice_val = builder_.CreateInsertValue(slice_val, len_val, 1, "s_len");
+                arg_val = slice_val;
+            } else if (arg_val && arg_val->getType()->isIntegerTy() && param_ty->isIntegerTy() &&
+                       arg_val->getType() != param_ty) {
+                arg_val = builder_.CreateZExtOrTrunc(arg_val, param_ty, "arg_cast");
+            }
+        }
+        args.push_back(arg_val);
+    }
+
+    if (callee_fn->getReturnType()->isVoidTy()) {
+        last_val_ = builder_.CreateCall(callee_fn, args);
+    } else {
+        last_val_ =
+            builder_.CreateCall(callee_fn, args, callee_name + "_call");
+    }
+}
+
+void LLVMCodegen::visit(const IndexExpr &node) {
+    node.object().accept(*this);
+    llvm::Value *base = last_val_;
+    node.index().accept(*this);
+    llvm::Value *idx = last_val_;
+
+    llvm::Value *buffer = base;
+    if (base && base->getType()->isStructTy()) {
+        buffer = builder_.CreateExtractValue(base, 0, "buf");
+    } else if (const auto *ident =
+                   dynamic_cast<const IdentifierExpr *>(&node.object())) {
+        const LLVMSymbol *s = lookup_symbol(ident->name());
+        if (s && s->type->isArrayTy()) {
+            buffer = s->alloca_inst;
+        }
+    }
+
+    llvm::Type *elem_ty = llvm::Type::getInt32Ty(ctx_);
+    llvm::Value *elem_ptr =
+        builder_.CreateGEP(elem_ty, buffer, idx, "elem_ptr");
+    last_val_ = builder_.CreateLoad(elem_ty, elem_ptr, "elem_val");
+}
+
+void LLVMCodegen::visit(const MemberAccessExpr &node) {
+    node.object().accept(*this);
+    llvm::Value *base = last_val_;
+
+    if (node.member() == "len") {
+        if (base && base->getType()->isStructTy()) {
+            last_val_ = builder_.CreateExtractValue(base, 1, "len");
+            return;
+        }
+        if (base && base->getType()->isPointerTy()) {
+            llvm::Type *slice_ty =
+                llvm::StructType::getTypeByName(ctx_, "struct.salmon_slice");
+            llvm::Value *len_ptr =
+                builder_.CreateStructGEP(slice_ty, base, 1, "len_ptr");
+            last_val_ = builder_.CreateLoad(llvm::Type::getInt64Ty(ctx_),
+                                            len_ptr, "len");
+            return;
+        }
+    }
+
+    for (const auto &[sname, info] : struct_defs_) {
+        auto field_it = info.field_indices.find(node.member());
+        if (field_it != info.field_indices.end()) {
+            if (base && base->getType()->isPointerTy()) {
+                llvm::Value *field_ptr = builder_.CreateStructGEP(
+                    info.llvm_type, base, field_it->second, node.member() + "_ptr");
+                llvm::Type *field_ty = to_llvm_type(*info.field_types.at(node.member()));
+                last_val_ =
+                    builder_.CreateLoad(field_ty, field_ptr, node.member() + "_val");
+            } else if (base && base->getType()->isStructTy()) {
+                last_val_ = builder_.CreateExtractValue(base, field_it->second,
+                                                        node.member() + "_val");
+            }
+            return;
+        }
+    }
+
+    std::vector<std::string> all_fields;
+    for (const auto &[sname, info] : struct_defs_) {
+        for (const auto &[f, _] : info.field_indices) {
+            all_fields.push_back(f);
+        }
+    }
+    std::string sim = DiagnosticEngine::find_similar(node.member(), all_fields);
+    std::vector<std::string> suggestions;
+    if (!sim.empty()) {
+        suggestions.push_back("did you mean '" + sim + "'?");
+    }
+    error(node.loc(), "unknown member access '" + node.member() + "'", {},
+          suggestions);
+}
 
 void LLVMCodegen::visit(const IntLiteralExpr &node) {
     last_val_ =
         llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx_), node.value());
-    (void)node;
 }
 
-void LLVMCodegen::visit(const FloatLiteralExpr &node) { (void)node; }
+void LLVMCodegen::visit(const FloatLiteralExpr &node) {
+    last_val_ =
+        llvm::ConstantFP::get(llvm::Type::getDoubleTy(ctx_), node.value());
+}
 
-void LLVMCodegen::visit(const StringLiteralExpr &node) { (void)node; }
+void LLVMCodegen::visit(const StringLiteralExpr &node) {
+    last_val_ = builder_.CreateGlobalString(node.value(), "str");
+}
 
-void LLVMCodegen::visit(const CharLiteralExpr &node) { (void)node; }
+void LLVMCodegen::visit(const CharLiteralExpr &node) {
+    last_val_ = llvm::ConstantInt::get(llvm::Type::getInt8Ty(ctx_),
+                                       static_cast<uint8_t>(node.value()));
+}
 
-void LLVMCodegen::visit(const BoolLiteralExpr &node) { (void)node; }
+void LLVMCodegen::visit(const BoolLiteralExpr &node) {
+    last_val_ = llvm::ConstantInt::get(llvm::Type::getInt1Ty(ctx_),
+                                       node.value() ? 1 : 0);
+}
 
-void LLVMCodegen::visit(const NullLiteralExpr &node) { (void)node; }
+void LLVMCodegen::visit(const NullLiteralExpr &node) {
+    (void)node;
+    last_val_ =
+        llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
+}
 
-void LLVMCodegen::visit(const ArrayLiteralExpr &node) { (void)node; }
+void LLVMCodegen::visit(const ArrayLiteralExpr &node) {
+    llvm::Type *i32_ty = llvm::Type::getInt32Ty(ctx_);
+    llvm::ArrayType *arr_ty =
+        llvm::ArrayType::get(i32_ty, node.elements().size());
+    llvm::AllocaInst *alloca =
+        builder_.CreateAlloca(arr_ty, nullptr, "arr_lit");
 
-void LLVMCodegen::visit(const ListLiteralExpr &node) { (void)node; }
+    for (size_t i = 0; i < node.elements().size(); ++i) {
+        node.elements()[i]->accept(*this);
+        llvm::Value *idx = llvm::ConstantInt::get(i32_ty, i);
+        llvm::Value *elem_ptr =
+            builder_.CreateGEP(arr_ty, alloca,
+                               {llvm::ConstantInt::get(i32_ty, 0), idx},
+                               "elem_init");
+        builder_.CreateStore(last_val_, elem_ptr);
+    }
+    last_val_ = builder_.CreateLoad(arr_ty, alloca, "arr_val");
+}
 
-void LLVMCodegen::visit(const AllocExpr &node) { (void)node; }
+void LLVMCodegen::visit(const ListLiteralExpr &node) {
+    llvm::Type *list_ty =
+        llvm::StructType::getTypeByName(ctx_, "struct.salmon_list");
+    llvm::AllocaInst *alloca =
+        builder_.CreateAlloca(list_ty, nullptr, "list_lit");
+
+    uint64_t count = node.elements().size();
+    llvm::Type *i64_ty = llvm::Type::getInt64Ty(ctx_);
+    llvm::Type *i32_ty = llvm::Type::getInt32Ty(ctx_);
+
+    llvm::Value *backing_ptr = nullptr;
+    if (count > 0) {
+        llvm::Function *malloc_fn = module_->getFunction("malloc");
+        llvm::Value *bytes =
+            llvm::ConstantInt::get(i64_ty, count * sizeof(int32_t));
+        backing_ptr = builder_.CreateCall(malloc_fn, {bytes}, "list_buf");
+        for (size_t i = 0; i < count; ++i) {
+            node.elements()[i]->accept(*this);
+            llvm::Value *idx = llvm::ConstantInt::get(i32_ty, i);
+            llvm::Value *elem_ptr =
+                builder_.CreateGEP(i32_ty, backing_ptr, idx, "list_elem");
+            builder_.CreateStore(last_val_, elem_ptr);
+        }
+    } else {
+        backing_ptr = llvm::ConstantPointerNull::get(
+            llvm::PointerType::getUnqual(ctx_));
+    }
+
+    llvm::Value *data_ptr =
+        builder_.CreateStructGEP(list_ty, alloca, 0, "list_data");
+    builder_.CreateStore(backing_ptr, data_ptr);
+
+    llvm::Value *len_ptr =
+        builder_.CreateStructGEP(list_ty, alloca, 1, "list_len");
+    builder_.CreateStore(llvm::ConstantInt::get(i64_ty, count), len_ptr);
+
+    llvm::Value *cap_ptr =
+        builder_.CreateStructGEP(list_ty, alloca, 2, "list_cap");
+    builder_.CreateStore(llvm::ConstantInt::get(i64_ty, count), cap_ptr);
+
+    last_val_ = builder_.CreateLoad(list_ty, alloca, "list_val");
+}
+
+void LLVMCodegen::visit(const AllocExpr &node) {
+    llvm::Type *elem_ty = to_llvm_type(node.alloc_type());
+    const llvm::DataLayout &dl = module_->getDataLayout();
+    uint64_t type_size = dl.getTypeAllocSize(elem_ty);
+
+    llvm::Value *size_val =
+        llvm::ConstantInt::get(llvm::Type::getInt64Ty(ctx_), type_size);
+    if (node.count()) {
+        node.count()->accept(*this);
+        llvm::Value *cnt = last_val_;
+        if (cnt->getType() != llvm::Type::getInt64Ty(ctx_)) {
+            cnt = builder_.CreateZExtOrTrunc(cnt, llvm::Type::getInt64Ty(ctx_));
+        }
+        size_val = builder_.CreateMul(size_val, cnt, "alloc_bytes");
+    }
+
+    llvm::Function *malloc_fn = module_->getFunction("malloc");
+    last_val_ = builder_.CreateCall(malloc_fn, {size_val}, "alloc_ptr");
+}
 
 void LLVMCodegen::visit(const IdentifierExpr &node) {
     const LLVMSymbol *s = lookup_symbol(node.name());
+    if (!s) {
+        std::vector<std::string> visible = get_visible_symbols();
+        std::string similar =
+            DiagnosticEngine::find_similar(node.name(), visible);
+        std::vector<std::string> suggestions;
+        if (!similar.empty()) {
+            suggestions.push_back("did you mean '" + similar + "'?");
+        }
+        error(node.loc(), "undefined variable '" + node.name() + "'", {},
+              suggestions);
+    }
     last_val_ = builder_.CreateLoad(s->type, s->alloca_inst, node.name());
 }
 
-// Types
 void LLVMCodegen::visit(const PrimitiveType &node) { (void)node; }
 
 void LLVMCodegen::visit(const NamedType &node) { (void)node; }

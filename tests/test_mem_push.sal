@@ -1,0 +1,27 @@
+include "std/io"
+include "std/mem"
+
+struct Point {
+    int x;
+    int y;
+}
+
+def main() -> int {
+    Point* pt = alloc<Point>();
+    pt.x = 42;
+    pt.y = 84;
+    printf("pt: (%d, %d)\n", pt.x, pt.y);
+    free(pt);
+
+    list<int> items = list{};
+    for (int i = 0; i < 8; i++) {
+        items.push(i * 10);
+    }
+
+    printf("items len: %d\n", items.len);
+    for (int j = 0; j < items.len; j++) {
+        printf("items[%d] = %d\n", j, items[j]);
+    }
+    items.free();
+    return 0;
+}

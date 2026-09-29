@@ -1,6 +1,7 @@
 #include "parser.h"
 
-Parser::Parser(std::vector<Token> tokens) : tokens_(std::move(tokens)) {
+Parser::Parser(std::vector<Token> tokens, std::string filename)
+    : tokens_(std::move(tokens)), filename_(std::move(filename)) {
 }
 
 const Token &Parser::peek() const {
@@ -52,7 +53,13 @@ const Token &Parser::consume(TokenType type, const std::string &message) {
 }
 
 void Parser::error(const Token &token, const std::string &message) const {
-    throw ParseError(token.line, token.col, message + " (got '" + token.lexeme + "')");
+    size_t len = token.lexeme.empty() ? 1 : token.lexeme.size();
+    SourceLoc loc{filename_, token.line, token.col, len};
+    std::string full_msg = message;
+    if (token.type != TokenType::EndOfFile && !token.lexeme.empty()) {
+        full_msg += " (got '" + token.lexeme + "')";
+    }
+    throw ParseError(loc, full_msg);
 }
 
 std::unique_ptr<Program> Parser::parse_program() {
@@ -79,7 +86,9 @@ std::unique_ptr<Decl> Parser::parse_decl() {
 std::unique_ptr<IncludeDirective> Parser::parse_include() {
     consume(TokenType::Include, "Expected 'include'");
     const auto &path = consume(TokenType::StringLiteral, "Expected string literal after 'include'");
-    return std::make_unique<IncludeDirective>(path.lexeme);
+    auto dir = std::make_unique<IncludeDirective>(path.lexeme);
+    dir->set_loc(loc_for(path));
+    return dir;
 }
 
 std::unique_ptr<StructDecl> Parser::parse_struct() {
@@ -319,7 +328,9 @@ std::unique_ptr<VarDeclStmt> Parser::parse_var_decl() {
     }
 
     consume(TokenType::Semicolon, "Expected ';' after variable declaration");
-    return std::make_unique<VarDeclStmt>(std::move(type), name.lexeme, std::move(init));
+    auto stmt = std::make_unique<VarDeclStmt>(std::move(type), name.lexeme, std::move(init));
+    stmt->set_loc(loc_for(name));
+    return stmt;
 }
 
 std::unique_ptr<Stmt> Parser::parse_assign_or_expr() {
@@ -346,13 +357,18 @@ std::unique_ptr<Stmt> Parser::parse_assign_or_expr() {
     }
 
     if (is_assign) {
+        SourceLoc loc = target->loc();
         auto val = parse_expr();
         consume(TokenType::Semicolon, "Expected ';' after assignment");
-        return std::make_unique<AssignStmt>(std::move(target), op, std::move(val));
+        auto stmt = std::make_unique<AssignStmt>(std::move(target), op, std::move(val));
+        stmt->set_loc(loc);
+        return stmt;
     }
 
     consume(TokenType::Semicolon, "Expected ';' after expression statement");
-    return std::make_unique<ExprStmt>(std::move(target));
+    auto stmt = std::make_unique<ExprStmt>(std::move(target));
+    stmt->set_loc(stmt->expr().loc());
+    return stmt;
 }
 
 std::unique_ptr<IfStmt> Parser::parse_if() {
@@ -545,19 +561,66 @@ std::unique_ptr<Expr> Parser::parse_multiplicative() {
 
 std::unique_ptr<Expr> Parser::parse_unary() {
     if (match(TokenType::Ampersand)) {
-        return std::make_unique<UnaryExpr>(UnaryOp::AddressOf, parse_unary());
+        const auto &tok = previous();
+        auto expr = std::make_unique<UnaryExpr>(UnaryOp::AddressOf, parse_unary());
+        expr->set_loc(loc_for(tok));
+        return expr;
     }
     if (match(TokenType::Star)) {
-        return std::make_unique<UnaryExpr>(UnaryOp::Dereference, parse_unary());
+        const auto &tok = previous();
+        auto expr = std::make_unique<UnaryExpr>(UnaryOp::Dereference, parse_unary());
+        expr->set_loc(loc_for(tok));
+        return expr;
     }
     if (match(TokenType::Bang)) {
-        return std::make_unique<UnaryExpr>(UnaryOp::LogicalNot, parse_unary());
+        const auto &tok = previous();
+        auto expr = std::make_unique<UnaryExpr>(UnaryOp::LogicalNot, parse_unary());
+        expr->set_loc(loc_for(tok));
+        return expr;
     }
     if (match(TokenType::Minus)) {
-        return std::make_unique<UnaryExpr>(UnaryOp::Negate, parse_unary());
+        const auto &tok = previous();
+        auto expr = std::make_unique<UnaryExpr>(UnaryOp::Negate, parse_unary());
+        expr->set_loc(loc_for(tok));
+        return expr;
     }
     if (match(TokenType::Sizeof)) {
-        return std::make_unique<SizeofExpr>(parse_unary());
+        const auto &tok = previous();
+        if (check(TokenType::LeftParen) && !is_at_end()) {
+            TokenType inner = peek_ahead(1).type;
+            switch (inner) {
+            case TokenType::Int:
+            case TokenType::I8:
+            case TokenType::I16:
+            case TokenType::I32:
+            case TokenType::I64:
+            case TokenType::UInt:
+            case TokenType::U8:
+            case TokenType::U16:
+            case TokenType::U32:
+            case TokenType::U64:
+            case TokenType::Float:
+            case TokenType::F32:
+            case TokenType::F64:
+            case TokenType::Bool:
+            case TokenType::Char:
+            case TokenType::Void: {
+                advance();
+                const auto &type_tok = advance();
+                consume(TokenType::RightParen, "Expected ')' after type in sizeof");
+                auto ident = std::make_unique<IdentifierExpr>(type_tok.lexeme);
+                ident->set_loc(loc_for(type_tok));
+                auto expr = std::make_unique<SizeofExpr>(std::move(ident));
+                expr->set_loc(loc_for(tok));
+                return expr;
+            }
+            default:
+                break;
+            }
+        }
+        auto expr = std::make_unique<SizeofExpr>(parse_unary());
+        expr->set_loc(loc_for(tok));
+        return expr;
     }
     return parse_postfix();
 }
@@ -567,10 +630,13 @@ std::unique_ptr<Expr> Parser::parse_postfix() {
 
     while (true) {
         if (match(TokenType::LeftBracket)) {
+            SourceLoc loc = expr->loc();
             auto idx = parse_expr();
             consume(TokenType::RightBracket, "Expected ']' after index");
             expr = std::make_unique<IndexExpr>(std::move(expr), std::move(idx));
+            expr->set_loc(loc);
         } else if (match(TokenType::LeftParen)) {
+            SourceLoc loc = expr->loc();
             std::vector<std::unique_ptr<Expr>> args;
             if (!check(TokenType::RightParen)) {
                 do {
@@ -579,14 +645,21 @@ std::unique_ptr<Expr> Parser::parse_postfix() {
             }
             consume(TokenType::RightParen, "Expected ')' after argument list");
             expr = std::make_unique<CallExpr>(std::move(expr), std::move(args));
-        } else if (match(TokenType::Dot) || match(TokenType::Arrow)) {
-            // Unified member access for both dot (.) and arrow (->)
+            expr->set_loc(loc);
+        } else if (match(TokenType::Dot)) {
             const auto &mem = consume(TokenType::Identifier, "Expected identifier after member access");
             expr = std::make_unique<MemberAccessExpr>(std::move(expr), mem.lexeme);
+            expr->set_loc(loc_for(mem));
+        } else if (match(TokenType::Arrow)) {
+            throw ParseError(loc_for(previous()), "use '.' instead of '->' for member access");
         } else if (match(TokenType::PlusPlus)) {
+            SourceLoc loc = expr->loc();
             expr = std::make_unique<PostfixUpdateExpr>(PostfixOp::PostIncrement, std::move(expr));
+            expr->set_loc(loc);
         } else if (match(TokenType::MinusMinus)) {
+            SourceLoc loc = expr->loc();
             expr = std::make_unique<PostfixUpdateExpr>(PostfixOp::PostDecrement, std::move(expr));
+            expr->set_loc(loc);
         } else {
             break;
         }
@@ -596,7 +669,7 @@ std::unique_ptr<Expr> Parser::parse_postfix() {
 }
 
 std::unique_ptr<AllocExpr> Parser::parse_alloc() {
-    consume(TokenType::Alloc, "Expected 'alloc'");
+    const auto &start_tok = consume(TokenType::Alloc, "Expected 'alloc'");
     consume(TokenType::Less, "Expected '<' after 'alloc'");
     auto type = parse_type();
     consume(TokenType::Greater, "Expected '>' after type in alloc");
@@ -609,11 +682,13 @@ std::unique_ptr<AllocExpr> Parser::parse_alloc() {
         consume(TokenType::RightParen, "Expected ')' after alloc argument");
     }
 
-    return std::make_unique<AllocExpr>(std::move(type), std::move(count));
+    auto expr = std::make_unique<AllocExpr>(std::move(type), std::move(count));
+    expr->set_loc(loc_for(start_tok));
+    return expr;
 }
 
 std::unique_ptr<ArrayLiteralExpr> Parser::parse_array_lit() {
-    consume(TokenType::LeftBracket, "Expected '['");
+    const auto &start_tok = consume(TokenType::LeftBracket, "Expected '['");
     std::vector<std::unique_ptr<Expr>> elements;
     if (!check(TokenType::RightBracket)) {
         do {
@@ -621,11 +696,13 @@ std::unique_ptr<ArrayLiteralExpr> Parser::parse_array_lit() {
         } while (match(TokenType::Comma));
     }
     consume(TokenType::RightBracket, "Expected ']' after array literal");
-    return std::make_unique<ArrayLiteralExpr>(std::move(elements));
+    auto expr = std::make_unique<ArrayLiteralExpr>(std::move(elements));
+    expr->set_loc(loc_for(start_tok));
+    return expr;
 }
 
 std::unique_ptr<ListLiteralExpr> Parser::parse_list_lit() {
-    consume(TokenType::List, "Expected 'list'");
+    const auto &start_tok = consume(TokenType::List, "Expected 'list'");
     consume(TokenType::LeftBrace, "Expected '{' after 'list'");
     std::vector<std::unique_ptr<Expr>> elements;
     if (!check(TokenType::RightBrace)) {
@@ -634,39 +711,57 @@ std::unique_ptr<ListLiteralExpr> Parser::parse_list_lit() {
         } while (match(TokenType::Comma));
     }
     consume(TokenType::RightBrace, "Expected '}' after list literal");
-    return std::make_unique<ListLiteralExpr>(std::move(elements));
+    auto expr = std::make_unique<ListLiteralExpr>(std::move(elements));
+    expr->set_loc(loc_for(start_tok));
+    return expr;
 }
 
 std::unique_ptr<Expr> Parser::parse_primary() {
     if (check(TokenType::Identifier)) {
         const auto &tok = advance();
-        return std::make_unique<IdentifierExpr>(tok.lexeme);
+        auto expr = std::make_unique<IdentifierExpr>(tok.lexeme);
+        expr->set_loc(loc_for(tok));
+        return expr;
     }
     if (check(TokenType::IntegerLiteral)) {
         const auto &tok = advance();
-        return std::make_unique<IntLiteralExpr>(std::stoll(tok.lexeme));
+        auto expr = std::make_unique<IntLiteralExpr>(std::stoll(tok.lexeme));
+        expr->set_loc(loc_for(tok));
+        return expr;
     }
     if (check(TokenType::FloatLiteral)) {
         const auto &tok = advance();
-        return std::make_unique<FloatLiteralExpr>(std::stod(tok.lexeme));
+        auto expr = std::make_unique<FloatLiteralExpr>(std::stod(tok.lexeme));
+        expr->set_loc(loc_for(tok));
+        return expr;
     }
     if (check(TokenType::StringLiteral)) {
         const auto &tok = advance();
-        return std::make_unique<StringLiteralExpr>(tok.lexeme);
+        auto expr = std::make_unique<StringLiteralExpr>(tok.lexeme);
+        expr->set_loc(loc_for(tok));
+        return expr;
     }
     if (check(TokenType::CharLiteral)) {
         const auto &tok = advance();
         char c = tok.lexeme.empty() ? '\0' : tok.lexeme[0];
-        return std::make_unique<CharLiteralExpr>(c);
+        auto expr = std::make_unique<CharLiteralExpr>(c);
+        expr->set_loc(loc_for(tok));
+        return expr;
     }
     if (match(TokenType::True)) {
-        return std::make_unique<BoolLiteralExpr>(true);
+        auto expr = std::make_unique<BoolLiteralExpr>(true);
+        expr->set_loc(loc_for(previous()));
+        return expr;
     }
     if (match(TokenType::False)) {
-        return std::make_unique<BoolLiteralExpr>(false);
+        auto expr = std::make_unique<BoolLiteralExpr>(false);
+        expr->set_loc(loc_for(previous()));
+        return expr;
     }
     if (match(TokenType::Null)) {
-        return std::make_unique<NullLiteralExpr>();
+        auto expr = std::make_unique<NullLiteralExpr>();
+        expr->set_loc(loc_for(previous()));
+        return expr;
     }
     if (match(TokenType::LeftParen)) {
         auto expr = parse_expr();

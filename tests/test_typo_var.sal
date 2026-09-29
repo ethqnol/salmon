@@ -1,0 +1,5 @@
+def main() -> int {
+    int total_count = 100;
+    totl_count = 200;
+    return 0;
+}

@@ -1,0 +1,5 @@
+include "std/i0"
+
+def main() -> int {
+    return 0;
+}

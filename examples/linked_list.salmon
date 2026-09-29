@@ -11,15 +11,15 @@ def create_node(int val) -> Node* {
     if (node == null) {
         return null;
     }
-    node->value = val;
-    node->next = null;
+    node.value = val;
+    node.next = null;
     return node;
 }
 
 def free_list(Node* head) -> void {
     Node* curr = head;
     while (curr != null) {
-        Node* temp = curr->next;
+        Node* temp = curr.next;
         free(curr);
         curr = temp;
     }
@@ -27,14 +27,13 @@ def free_list(Node* head) -> void {
 
 def main() -> int {
     Node* head = create_node(100);
-    head->next = create_node(200);
-    head->next->next = create_node(300);
+    head.next = create_node(200);
+    head.next.next = create_node(300);
 
-    // Traversing raw heap nodes
     Node* curr = head;
     while (curr != null) {
-        printf("Node value: %d\n", curr->value);
-        curr = curr->next;
+        printf("Node value: %d\n", curr.value);
+        curr = curr.next;
     }
 
     free_list(head);

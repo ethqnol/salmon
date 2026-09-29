@@ -1,0 +1,12 @@
+struct Node {
+    int value;
+    Node* next;
+}
+
+def test(Node* n) -> int {
+    return n.valeu;
+}
+
+def main() -> int {
+    return 0;
+}

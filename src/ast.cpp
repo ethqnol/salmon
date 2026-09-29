@@ -156,7 +156,6 @@ static void emit_node_list(std::ostream &out, const std::vector<std::unique_ptr<
     out << indent_str(indent) << "]";
 }
 
-// Types
 void PrimitiveType::emit_asdl(std::ostream &out, int /*indent*/) const {
     out << "PrimitiveType(kind=" << primitive_kind_str(kind_) << ")";
 }
@@ -267,7 +266,6 @@ void ArrayType::pretty_print(std::ostream &out, int indent) const {
     out << "[" << size_ << "]";
 }
 
-// Declarations
 void IncludeDirective::emit_asdl(std::ostream &out, int /*indent*/) const {
     out << "Include(path=\"" << path_ << "\")";
 }
@@ -386,7 +384,6 @@ void FunctionDecl::print_tree(std::ostream &out, const std::string &prefix, bool
     body_->print_tree(out, next_prefix, true);
 }
 
-// Statements
 void BlockStmt::emit_asdl(std::ostream &out, int indent) const {
     out << "Block(\n";
     out << indent_str(indent + 1) << "statements=";
@@ -688,7 +685,6 @@ void DeferStmt::print_tree(std::ostream &out, const std::string &prefix, bool is
     stmt_->print_tree(out, next_prefix, true);
 }
 
-// Expressions
 void BinaryExpr::emit_asdl(std::ostream &out, int indent) const {
     out << "BinaryExpr(\n";
     out << indent_str(indent + 1) << "op=" << binary_op_str(op_) << ",\n";
@@ -1136,7 +1132,6 @@ void IdentifierExpr::print_tree(std::ostream &out, const std::string &prefix, bo
     out << prefix << (is_last ? "└── " : "├── ") << "Identifier " << name_ << "\n";
 }
 
-// Program
 void Program::emit_asdl(std::ostream &out, int indent) const {
     out << "Program(\n";
     out << indent_str(indent + 1) << "declarations=";

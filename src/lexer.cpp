@@ -207,12 +207,12 @@ void Lexer::skip_whitespace() {
                 advance();
             }
         } else if (c == '/' && peek_next() == '*') {
-            advance(); // '/'
-            advance(); // '*'
+            advance();
+            advance();
             while (!is_at_end()) {
                 if (peek() == '*' && peek_next() == '/') {
-                    advance(); // '*'
-                    advance(); // '/'
+                    advance();
+                    advance();
                     break;
                 }
                 advance();
@@ -346,7 +346,7 @@ Token Lexer::lex_string() {
         return make_token(TokenType::Invalid, "Unterminated string");
     }
 
-    advance(); // closing '"'
+    advance();
     return make_token(TokenType::StringLiteral, value);
 }
 
@@ -390,7 +390,7 @@ Token Lexer::lex_char() {
         return make_token(TokenType::Invalid, "Unterminated char");
     }
 
-    advance(); // closing '\''
+    advance();
     return make_token(TokenType::CharLiteral, value);
 }
 

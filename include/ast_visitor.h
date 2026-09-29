@@ -46,7 +46,6 @@ class ASTVisitor {
 public:
     virtual ~ASTVisitor() = default;
 
-    // Declarations
     virtual void visit(const Program &node) = 0;
     virtual void visit(const IncludeDirective &node) = 0;
     virtual void visit(const StructField &node) = 0;
@@ -54,7 +53,6 @@ public:
     virtual void visit(const Param &node) = 0;
     virtual void visit(const FunctionDecl &node) = 0;
 
-    // Statements
     virtual void visit(const BlockStmt &node) = 0;
     virtual void visit(const VarDeclStmt &node) = 0;
     virtual void visit(const AssignStmt &node) = 0;
@@ -65,7 +63,6 @@ public:
     virtual void visit(const ReturnStmt &node) = 0;
     virtual void visit(const DeferStmt &node) = 0;
 
-    // Expressions
     virtual void visit(const BinaryExpr &node) = 0;
     virtual void visit(const UnaryExpr &node) = 0;
     virtual void visit(const SizeofExpr &node) = 0;
@@ -84,7 +81,6 @@ public:
     virtual void visit(const AllocExpr &node) = 0;
     virtual void visit(const IdentifierExpr &node) = 0;
 
-    // Types
     virtual void visit(const PrimitiveType &node) = 0;
     virtual void visit(const NamedType &node) = 0;
     virtual void visit(const ListType &node) = 0;

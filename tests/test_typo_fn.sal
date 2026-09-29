@@ -1,0 +1,6 @@
+include "std/io"
+
+def main() -> int {
+    printff("Hello, Salmon!\n");
+    return 0;
+}

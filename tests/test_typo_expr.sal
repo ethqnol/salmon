@@ -1,0 +1,5 @@
+def main() -> int {
+    int max_capacity = 50;
+    int cur = max_cpacity + 5;
+    return 0;
+}
